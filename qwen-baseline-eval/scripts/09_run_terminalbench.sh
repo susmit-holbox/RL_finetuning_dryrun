@@ -14,29 +14,27 @@ load_config
 
 log "=== Step 9: TerminalBench evaluation ==="
 
-# Use the OpenHands venv (has tb and Python 3.12/3.13)
-VENV_PYTHON_FILE="${OPENHANDS_DIR}/.venv_python"
-if [[ -f "$VENV_PYTHON_FILE" ]]; then
-    VENV_PYTHON=$(cat "$VENV_PYTHON_FILE")
-    VENV_BIN=$(dirname "$VENV_PYTHON")
-    TB_BIN="${VENV_BIN}/tb"
-else
-    VENV_BIN=""
-    TB_BIN=$(command -v tb 2>/dev/null || echo "tb")
-fi
-PYTHON="${VENV_PYTHON:-$(command -v python3)}"
+# terminal-bench lives in the EVAL venv (set up in step 6).
+EVAL_PY=$(eval_python)
+EVAL_BIN=$(dirname "$EVAL_PY")
+PYTHON="$EVAL_PY"
+
+# Resolve tb: prefer the marker written by step 6, then eval venv, then PATH
+TB_BIN=""
+if [[ -f "${SCRIPT_DIR}/../results/.tb_bin" ]]; then TB_BIN=$(cat "${SCRIPT_DIR}/../results/.tb_bin"); fi
+if [[ ! -x "$TB_BIN" ]] && [[ -x "${EVAL_BIN}/tb" ]]; then TB_BIN="${EVAL_BIN}/tb"; fi
+if [[ ! -x "$TB_BIN" ]]; then TB_BIN=$(command -v tb 2>/dev/null || echo ""); fi
 
 # ---------------------------------------------------------------------------
 # Pre-flight checks
 # ---------------------------------------------------------------------------
-if [[ ! -x "$TB_BIN" ]] && ! command -v tb &>/dev/null; then
-    warn "'tb' not found — trying to install terminal-bench…"
-    pip_cmd="${VENV_BIN:+${VENV_BIN}/pip}"
-    ${pip_cmd:-pip3} install --quiet \
+if [[ ! -x "$TB_BIN" ]]; then
+    warn "'tb' not found — installing terminal-bench into eval venv…"
+    "${EVAL_BIN}/pip" install --quiet \
         "git+https://github.com/harbor-framework/terminal-bench.git" || \
         die "terminal-bench installation failed"
-    TB_BIN="${VENV_BIN:+${VENV_BIN}/tb}"
-    TB_BIN="${TB_BIN:-$(command -v tb)}"
+    TB_BIN="${EVAL_BIN}/tb"
+    [[ -x "$TB_BIN" ]] || die "terminal-bench installed but 'tb' binary missing at ${TB_BIN}"
 fi
 
 if ! curl -sf "http://localhost:${VLLM_PORT}/health" &>/dev/null; then

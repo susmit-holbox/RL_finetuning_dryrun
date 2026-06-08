@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # 01_setup_env.sh — Bootstrap a fresh Ubuntu EC2 GPU instance.
 #
-# vLLM + PyTorch require Python 3.10–3.13.  Python 3.14+ has no torch wheels.
-# This script installs a compatible Python and creates the eval venv with it.
-# OpenHands uses a separate python3.12/3.13 venv (step 6).
+# Why uv?  vLLM + PyTorch only publish wheels for CPython 3.10–3.13 (there are
+# ZERO torch wheels for 3.14).  This box ships Python 3.14 as its system python,
+# and apt / deadsnakes / conda all failed to provide a 3.12 cleanly.  `uv`
+# downloads a fully self-contained CPython 3.12 with no apt, no PPA, no conda
+# ToS prompts, and no PEP 668 restrictions.  It is the one method that always
+# works, so we standardise on it.
 #
 set -euo pipefail
 
@@ -11,8 +14,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib.sh"
 load_config
 
-# Safety net: config.env may be an older version that predates EVAL_VENV_DIR
+# Safety net: config.env may predate these vars
 EVAL_VENV_DIR="${EVAL_VENV_DIR:-${HOME}/eval_venv}"
+PY_VERSION="${PY_VERSION:-3.12}"   # target Python for eval + OpenHands venvs
 
 log "=== Step 1: Environment setup ==="
 
@@ -55,92 +59,66 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2. System packages
+# 2. System packages (build tools, git, curl, screen, etc.)
 # ---------------------------------------------------------------------------
 log "Installing system packages via apt…"
-sudo apt-get update -qq 2>/dev/null
-
+sudo apt-get update -qq 2>/dev/null || true
 sudo apt-get install -y -qq \
     git curl wget screen htop jq pciutils \
     build-essential libssl-dev libffi-dev \
     ca-certificates gnupg lsb-release \
-    python3 python3-venv python3-full \
     2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 2b. Install Python 3.12 or 3.13 — required for vLLM + PyTorch (no 3.14 wheels)
-#
-# Try in order:
-#   1. Already installed
-#   2. Direct apt (Ubuntu 24.04 main/universe repos)
-#   3. deadsnakes PPA
-#   4. Miniconda with python=3.12 (last resort)
+# 3. Install uv (self-contained Python + package manager)
 # ---------------------------------------------------------------------------
-_find_compat_python() {
-    for v in python3.12 python3.13 python3.11 python3.10; do
-        command -v "$v" &>/dev/null && { echo "$(command -v "$v")"; return 0; }
+ensure_uv() {
+    # Already on PATH?
+    if command -v uv &>/dev/null; then echo "$(command -v uv)"; return 0; fi
+    # Common install locations from a previous run
+    for c in "${HOME}/.local/bin/uv" "${HOME}/.cargo/bin/uv"; do
+        [[ -x "$c" ]] && { echo "$c"; return 0; }
+    done
+    # Fresh install
+    log "Installing uv…" >&2
+    curl -LsSf https://astral.sh/uv/install.sh | sh >&2 2>&1 || return 1
+    for c in "${HOME}/.local/bin/uv" "${HOME}/.cargo/bin/uv"; do
+        [[ -x "$c" ]] && { echo "$c"; return 0; }
     done
     return 1
 }
 
-COMPAT_PYTHON=$(_find_compat_python || true)
-
-if [[ -z "$COMPAT_PYTHON" ]]; then
-    log "No Python 3.10–3.13 found; system has $(python3 --version). Attempting install…"
-
-    # Attempt 1: direct apt (no PPA needed on some Ubuntu versions)
-    for pyver in 3.12 3.13; do
-        if sudo apt-get install -y -qq "python${pyver}" "python${pyver}-venv" "python${pyver}-dev" 2>/dev/null; then
-            command -v "python${pyver}" &>/dev/null && {
-                COMPAT_PYTHON=$(command -v "python${pyver}")
-                log "Installed python${pyver} via apt"
-                break
-            }
-        fi
-    done
-fi
-
-if [[ -z "$COMPAT_PYTHON" ]]; then
-    # Attempt 2: deadsnakes PPA
-    log "Trying deadsnakes PPA…"
-    sudo apt-get install -y -qq software-properties-common 2>/dev/null || true
-    sudo add-apt-repository -y ppa:deadsnakes/ppa 2>&1 | tail -3 || true
-    sudo apt-get update -qq 2>/dev/null
-    for pyver in 3.12 3.13; do
-        if sudo apt-get install -y -qq "python${pyver}" "python${pyver}-venv" "python${pyver}-dev" 2>/dev/null; then
-            command -v "python${pyver}" &>/dev/null && {
-                COMPAT_PYTHON=$(command -v "python${pyver}")
-                log "Installed python${pyver} via deadsnakes PPA"
-                break
-            }
-        fi
-    done
-fi
-
-if [[ -z "$COMPAT_PYTHON" ]]; then
-    # Attempt 3: Miniconda
-    warn "apt methods failed — installing Miniconda to get Python 3.12"
-    CONDA_DIR="${HOME}/miniconda3"
-    CONDA_INSTALLER="/tmp/miniconda_install.sh"
-    if [[ ! -x "${CONDA_DIR}/bin/conda" ]]; then
-        curl -fsSL "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh" \
-            -o "$CONDA_INSTALLER"
-        bash "$CONDA_INSTALLER" -b -p "${CONDA_DIR}"
-    fi
-    if [[ ! -x "${CONDA_DIR}/envs/eval312/bin/python" ]]; then
-        "${CONDA_DIR}/bin/conda" create -n eval312 python=3.12 -y -q
-    fi
-    COMPAT_PYTHON="${CONDA_DIR}/envs/eval312/bin/python"
-fi
-
-if [[ -z "$COMPAT_PYTHON" ]] || [[ ! -x "$COMPAT_PYTHON" ]]; then
-    die "Cannot find or install Python 3.10–3.13. PyTorch/vLLM have no wheels for $(python3 --version)."
-fi
-
-ok "Compatible Python for vLLM/torch: $($COMPAT_PYTHON --version) at ${COMPAT_PYTHON}"
+UV=$(ensure_uv) || die "Failed to install uv. Install manually: curl -LsSf https://astral.sh/uv/install.sh | sh"
+export PATH="$(dirname "$UV"):${PATH}"
+ok "uv: $("$UV" --version)"
 
 # ---------------------------------------------------------------------------
-# 3. Docker CE
+# 4. Resolve a torch-compatible Python (3.10–3.13)
+#    Prefer an existing system python3.12/3.13; otherwise let uv fetch one.
+# ---------------------------------------------------------------------------
+COMPAT_PYTHON=""
+for v in "python${PY_VERSION}" python3.12 python3.13 python3.11 python3.10; do
+    if command -v "$v" &>/dev/null; then
+        minor=$("$v" -c 'import sys; print(sys.version_info.minor)' 2>/dev/null || echo 99)
+        if (( minor >= 10 && minor <= 13 )); then
+            COMPAT_PYTHON=$(command -v "$v")
+            log "Found system Python: ${COMPAT_PYTHON} ($($COMPAT_PYTHON --version))"
+            break
+        fi
+    fi
+done
+
+if [[ -z "$COMPAT_PYTHON" ]]; then
+    log "No system Python 3.10–3.13 found; fetching CPython ${PY_VERSION} via uv…"
+    "$UV" python install "${PY_VERSION}" >&2
+    COMPAT_PYTHON=$("$UV" python find "${PY_VERSION}")
+    ok "uv-managed Python: ${COMPAT_PYTHON} ($($COMPAT_PYTHON --version))"
+fi
+
+[[ -x "$COMPAT_PYTHON" ]] || die "Could not resolve a Python 3.10–3.13 interpreter."
+
+# ---------------------------------------------------------------------------
+# 5. Docker CE
 # ---------------------------------------------------------------------------
 if ! command -v docker &>/dev/null; then
     log "Installing Docker CE…"
@@ -166,46 +144,43 @@ if command -v docker &>/dev/null && ! groups "$USER" | grep -q docker; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Create eval venv using the compatible Python (3.12 or 3.13, NOT 3.14+)
-#
-# PyTorch CUDA wheels exist for cp310-cp313; cp314 is not yet published.
-# All vLLM + eval tool installs go into this venv.
-# OpenHands uses a SEPARATE venv (step 6).
+# 6. Create the eval venv with the compatible Python (via uv, --seed adds pip)
 # ---------------------------------------------------------------------------
-log "System Python: $(python3 --version)"
-log "Eval venv Python: $($COMPAT_PYTHON --version)"
+_venv_is_compatible() {
+    [[ -x "${EVAL_VENV_DIR}/bin/python" ]] || return 1
+    local minor
+    minor=$("${EVAL_VENV_DIR}/bin/python" -c 'import sys; print(sys.version_info.minor)' 2>/dev/null || echo 99)
+    (( minor >= 10 && minor <= 13 ))
+}
 
-if [[ ! -x "${EVAL_VENV_DIR}/bin/python" ]]; then
-    log "Creating eval venv at ${EVAL_VENV_DIR}…"
-    "$COMPAT_PYTHON" -m venv "${EVAL_VENV_DIR}"
-    ok "Eval venv created"
+if _venv_is_compatible; then
+    ok "Eval venv already compatible: $(${EVAL_VENV_DIR}/bin/python --version)"
 else
-    EXISTING_VER=$("${EVAL_VENV_DIR}/bin/python" --version 2>&1)
-    # If existing venv is Python 3.14, recreate it with compatible Python
-    if echo "$EXISTING_VER" | grep -q "3\.14"; then
-        warn "Existing eval venv uses Python 3.14 (no torch wheels) — recreating with $($COMPAT_PYTHON --version)"
+    if [[ -d "${EVAL_VENV_DIR}" ]]; then
+        warn "Existing eval venv is incompatible (likely Python 3.14) — recreating"
         rm -rf "${EVAL_VENV_DIR}"
-        "$COMPAT_PYTHON" -m venv "${EVAL_VENV_DIR}"
-        ok "Eval venv recreated"
-    else
-        ok "Eval venv already exists: ${EXISTING_VER}"
     fi
+    log "Creating eval venv at ${EVAL_VENV_DIR} with $($COMPAT_PYTHON --version)…"
+    "$UV" venv "${EVAL_VENV_DIR}" --python "${COMPAT_PYTHON}" --seed
+    ok "Eval venv created"
 fi
 
 "${EVAL_VENV_DIR}/bin/pip" install --upgrade pip wheel setuptools --quiet
 ok "Venv pip: $(${EVAL_VENV_DIR}/bin/pip --version)"
 
-# Write venv path for downstream scripts
+# ---------------------------------------------------------------------------
+# 7. Record paths for downstream scripts
+# ---------------------------------------------------------------------------
 mkdir -p "${SCRIPT_DIR}/../results"
 echo "${EVAL_VENV_DIR}/bin/python" > "${SCRIPT_DIR}/../results/.eval_python"
-echo "RUN_TAG=${RUN_TAG}" > "${SCRIPT_DIR}/../results/.run_tag"
+echo "${COMPAT_PYTHON}"            > "${SCRIPT_DIR}/../results/.compat_python"
+echo "${UV}"                       > "${SCRIPT_DIR}/../results/.uv_bin"
+echo "RUN_TAG=${RUN_TAG}"          > "${SCRIPT_DIR}/../results/.run_tag"
 
-# ---------------------------------------------------------------------------
-# 5. Results directory
-# ---------------------------------------------------------------------------
 mkdir -p "${RESULTS_DIR}/${RUN_TAG}"
 ok "Results dir: ${RESULTS_DIR}/${RUN_TAG}"
 
 ok "=== Environment setup complete ==="
-log "Eval venv: ${EVAL_VENV_DIR} ($($COMPAT_PYTHON --version))"
-log "Use this Python for all steps: ${EVAL_VENV_DIR}/bin/python"
+log "uv:             ${UV}"
+log "Compatible py:  ${COMPAT_PYTHON} ($($COMPAT_PYTHON --version))"
+log "Eval venv:      ${EVAL_VENV_DIR} ($(${EVAL_VENV_DIR}/bin/python --version))"

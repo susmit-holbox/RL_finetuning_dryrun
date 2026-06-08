@@ -15,13 +15,23 @@ load_config
 
 log "=== Step 10: SWE-bench evaluation ==="
 
-# Use the OpenHands venv Python (requires Python 3.12/3.13, not 3.14)
+# OpenHands runs under Poetry; run_infer.sh calls `poetry run python …`.
+# We need: (a) the poetry binary on PATH, (b) the poetry venv python for scoring.
 VENV_PYTHON_FILE="${OPENHANDS_DIR}/.venv_python"
 if [[ -f "$VENV_PYTHON_FILE" ]]; then
     PYTHON=$(cat "$VENV_PYTHON_FILE")
 else
     PYTHON=$(command -v python3.12 || command -v python3.13 || command -v python3)
 fi
+
+# Put poetry on PATH so run_infer.sh's `poetry run` resolves.
+POETRY_BIN=""
+if [[ -f "${SCRIPT_DIR}/../results/.poetry_bin" ]]; then POETRY_BIN=$(cat "${SCRIPT_DIR}/../results/.poetry_bin"); fi
+if [[ ! -x "$POETRY_BIN" ]]; then POETRY_BIN=$(command -v poetry 2>/dev/null || true); fi
+if [[ ! -x "$POETRY_BIN" ]] && [[ -x "${HOME}/.local/bin/poetry" ]]; then POETRY_BIN="${HOME}/.local/bin/poetry"; fi
+[[ -x "$POETRY_BIN" ]] || die "poetry not found — run 06_setup_openhands.sh first (run_infer.sh requires it)."
+export PATH="$(dirname "$POETRY_BIN"):${PATH}"
+log "Using poetry: ${POETRY_BIN} ($("$POETRY_BIN" --version 2>&1))"
 
 # ---------------------------------------------------------------------------
 # Pre-flight checks

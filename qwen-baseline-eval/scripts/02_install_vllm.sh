@@ -12,40 +12,42 @@ log "=== Step 2: Install vLLM ==="
 PYTHON=$(eval_python)
 PIP=$(dirname "$PYTHON")/pip
 
-# Ensure venv exists with a Python version that has torch wheels (3.10-3.13)
-_check_venv_python_ok() {
-    local py="$1"
-    [[ -x "$py" ]] || return 1
-    local minor
-    minor=$("$py" -c "import sys; print(sys.version_info.minor)" 2>/dev/null)
-    (( minor <= 13 ))
+# The eval venv must use Python 3.10–3.13 (no torch wheels for 3.14).
+# Step 1 creates it via uv; this is a safety net if step 1 was skipped.
+_venv_minor() {
+    [[ -x "$1" ]] || { echo 99; return; }
+    "$1" -c 'import sys; print(sys.version_info.minor)' 2>/dev/null || echo 99
 }
 
-if ! _check_venv_python_ok "$PYTHON"; then
-    if _check_venv_python_ok "$PYTHON"; then
-        : # already OK
-    else
-        log "Eval venv missing or uses Python 3.14+ (no torch wheels) — creating with python3.12/3.13"
-        # Find compatible Python
-        COMPAT=""
-        for v in python3.12 python3.13 python3.11 python3.10; do
-            command -v "$v" &>/dev/null && { COMPAT=$(command -v "$v"); break; }
-        done
-        [[ -n "$COMPAT" ]] || die "No Python 3.10–3.13 found. Run step 1 first: bash scripts/01_setup_env.sh"
-        [[ -d "${EVAL_VENV_DIR}" ]] && rm -rf "${EVAL_VENV_DIR}"
-        "$COMPAT" -m venv "${EVAL_VENV_DIR}"
-        "${EVAL_VENV_DIR}/bin/pip" install --upgrade pip wheel setuptools --quiet
-        mkdir -p "${SCRIPT_DIR}/../results"
-        echo "${EVAL_VENV_DIR}/bin/python" > "${SCRIPT_DIR}/../results/.eval_python"
-        PYTHON=$(eval_python)
-        PIP=$(dirname "$PYTHON")/pip
+if ! [[ -x "$PYTHON" ]] || (( $(_venv_minor "$PYTHON") > 13 )); then
+    warn "Eval venv missing or Python 3.14+ (no torch wheels) — rebuilding via uv"
+    # Resolve uv (recorded by step 1, else on PATH, else known locations)
+    UV=""
+    if [[ -f "${SCRIPT_DIR}/../results/.uv_bin" ]]; then UV=$(cat "${SCRIPT_DIR}/../results/.uv_bin"); fi
+    if ! [[ -x "$UV" ]]; then UV=$(command -v uv 2>/dev/null || true); fi
+    if ! [[ -x "$UV" ]] && [[ -x "${HOME}/.local/bin/uv" ]]; then UV="${HOME}/.local/bin/uv"; fi
+    if ! [[ -x "$UV" ]] && [[ -x "${HOME}/.cargo/bin/uv" ]]; then UV="${HOME}/.cargo/bin/uv"; fi
+    [[ -x "$UV" ]] || die "uv not found. Run step 1 first: bash scripts/01_setup_env.sh"
+
+    # Compatible Python: recorded by step 1, else uv-managed 3.12
+    COMPAT=""
+    [[ -f "${SCRIPT_DIR}/../results/.compat_python" ]] && COMPAT=$(cat "${SCRIPT_DIR}/../results/.compat_python")
+    if ! [[ -x "$COMPAT" ]]; then
+        "$UV" python install 3.12
+        COMPAT=$("$UV" python find 3.12)
     fi
+
+    [[ -d "${EVAL_VENV_DIR}" ]] && rm -rf "${EVAL_VENV_DIR}"
+    "$UV" venv "${EVAL_VENV_DIR}" --python "${COMPAT}" --seed
+    "${EVAL_VENV_DIR}/bin/pip" install --upgrade pip wheel setuptools --quiet
+    mkdir -p "${SCRIPT_DIR}/../results"
+    echo "${EVAL_VENV_DIR}/bin/python" > "${SCRIPT_DIR}/../results/.eval_python"
+    PYTHON=$(eval_python)
+    PIP=$(dirname "$PYTHON")/pip
 fi
 
 log "Using Python: $PYTHON ($($PYTHON --version))"
-# Verify Python version is torch-compatible
-_MINOR=$("$PYTHON" -c "import sys; print(sys.version_info.minor)")
-(( _MINOR >= 10 && _MINOR <= 13 )) || die "Python 3.${_MINOR} in eval venv has no PyTorch CUDA wheels. Re-run step 1."
+(( $(_venv_minor "$PYTHON") <= 13 )) || die "Python in eval venv has no PyTorch CUDA wheels. Re-run step 1."
 
 # ---------------------------------------------------------------------------
 # Already installed?

@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # 06_setup_openhands.sh — Clone and install OpenHands + evaluation dependencies.
 #
-# OpenHands 0.62.0 requires Python >=3.12,<3.14.
-# This script creates a dedicated Python 3.12/3.13 virtual environment for
-# OpenHands, separate from the system Python used for vLLM (which may be 3.14+).
-# The venv is written to ${OPENHANDS_DIR}/.venv and its Python path is stored in
-# ${OPENHANDS_DIR}/.venv_python for use by evaluation runner scripts.
+# OpenHands 0.62.0 requires Python >=3.12,<3.14 and is a POETRY project.  Its
+# SWE-bench eval runner (run_infer.sh) calls `poetry run python …`, so we must
+# install via Poetry, not a plain pip venv.  SWE-bench eval deps (swebench,
+# datasets, …) are in the OPTIONAL poetry group `evaluation`.
+#
+# Markers written for downstream steps:
+#   ${OPENHANDS_DIR}/.venv_python  → poetry venv python (steps 9/10 scoring)
+#   results/.poetry_bin            → poetry binary (step 10 uses `poetry run`)
+#   results/.tb_bin                → terminal-bench binary (in the eval venv)
 #
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib.sh"
@@ -15,29 +19,51 @@ log "=== Step 6: Setup OpenHands ==="
 
 # ---------------------------------------------------------------------------
 # Find Python 3.12 or 3.13 (OpenHands requires >=3.12,<3.14)
+# Priority: the compatible Python step 1 recorded → system 3.12/3.13 → uv.
 # ---------------------------------------------------------------------------
+_minor_of() { "$1" -c 'import sys; print(sys.version_info.minor)' 2>/dev/null || echo 99; }
+
 OH_PYTHON=""
-for candidate in python3.12 python3.13; do
-    if command -v "$candidate" &>/dev/null; then
-        ver=$($candidate --version 2>&1 | awk '{print $2}')
-        minor=$(echo "$ver" | cut -d. -f2)
-        if (( minor >= 12 && minor <= 13 )); then
-            OH_PYTHON=$(command -v "$candidate")
-            log "Found compatible Python for OpenHands: ${OH_PYTHON} (${ver})"
-            break
+
+# 1. Reuse what step 1 resolved (it targets 3.12 by default)
+if [[ -f "${SCRIPT_DIR}/../results/.compat_python" ]]; then
+    cand=$(cat "${SCRIPT_DIR}/../results/.compat_python")
+    if [[ -x "$cand" ]]; then
+        m=$(_minor_of "$cand")
+        if (( m >= 12 && m <= 13 )); then
+            OH_PYTHON="$cand"
+            log "Reusing step-1 Python for OpenHands: ${OH_PYTHON} ($($cand --version))"
         fi
     fi
-done
+fi
 
+# 2. Any system python3.12/3.13
 if [[ -z "$OH_PYTHON" ]]; then
-    # Try to install python3.12 via apt (Ubuntu/Debian GPU instances)
-    warn "No Python 3.12/3.13 found. Attempting to install python3.12…"
-    if command -v apt-get &>/dev/null; then
-        sudo apt-get install -y -qq python3.12 python3.12-venv 2>/dev/null && \
-            OH_PYTHON=$(command -v python3.12) || true
+    for candidate in python3.12 python3.13; do
+        if command -v "$candidate" &>/dev/null; then
+            m=$(_minor_of "$(command -v "$candidate")")
+            if (( m >= 12 && m <= 13 )); then
+                OH_PYTHON=$(command -v "$candidate")
+                log "Found compatible Python for OpenHands: ${OH_PYTHON}"
+                break
+            fi
+        fi
+    done
+fi
+
+# 3. uv-managed Python 3.12
+if [[ -z "$OH_PYTHON" ]]; then
+    warn "No Python 3.12/3.13 found — fetching one via uv…"
+    UV=""
+    if [[ -f "${SCRIPT_DIR}/../results/.uv_bin" ]]; then UV=$(cat "${SCRIPT_DIR}/../results/.uv_bin"); fi
+    if ! [[ -x "$UV" ]]; then UV=$(command -v uv 2>/dev/null || true); fi
+    if ! [[ -x "$UV" ]] && [[ -x "${HOME}/.local/bin/uv" ]]; then UV="${HOME}/.local/bin/uv"; fi
+    if ! [[ -x "$UV" ]] && [[ -x "${HOME}/.cargo/bin/uv" ]]; then UV="${HOME}/.cargo/bin/uv"; fi
+    if [[ -x "$UV" ]]; then
+        "$UV" python install 3.12 && OH_PYTHON=$("$UV" python find 3.12) || true
     fi
-    [[ -z "$OH_PYTHON" ]] && die \
-        "OpenHands requires Python 3.12 or 3.13 (not 3.14+). Install with:\n  sudo apt install python3.12 python3.12-venv\nor use pyenv/conda."
+    [[ -x "$OH_PYTHON" ]] || die \
+        "OpenHands requires Python 3.12/3.13. Could not find or install one.\n  Run step 1 first, or: curl -LsSf https://astral.sh/uv/install.sh | sh && uv python install 3.12"
 fi
 
 # ---------------------------------------------------------------------------
@@ -70,62 +96,90 @@ fi
 ok "run_infer.py and run_infer.sh present"
 
 # ---------------------------------------------------------------------------
-# Create / reuse a dedicated venv with the compatible Python
+# Install OpenHands with POETRY (REQUIRED).
+#
+# OpenHands 0.62.0 is a Poetry project, and the eval runner
+# evaluation/benchmarks/swe_bench/scripts/run_infer.sh invokes the model via
+# `poetry run python …`.  A plain pip/venv install is therefore NOT usable by
+# the eval harness — we must create a Poetry-managed environment.
+#
+# The SWE-bench eval dependencies (swebench, datasets, …) live in the OPTIONAL
+# Poetry group `evaluation`, so we install with `--with evaluation`.
 # ---------------------------------------------------------------------------
-VENV_DIR="${OPENHANDS_DIR}/.venv"
-VENV_PYTHON="${VENV_DIR}/bin/python"
-VENV_PIP="${VENV_DIR}/bin/pip"
 
-if [[ ! -x "${VENV_PYTHON}" ]]; then
-    log "Creating OpenHands venv at ${VENV_DIR} using ${OH_PYTHON}…"
-    "${OH_PYTHON}" -m venv "${VENV_DIR}"
-    ok "venv created"
+# --- Resolve / install poetry (prefer uv tool install) ---
+resolve_uv() {
+    local u=""
+    [[ -f "${SCRIPT_DIR}/../results/.uv_bin" ]] && u=$(cat "${SCRIPT_DIR}/../results/.uv_bin")
+    [[ -x "$u" ]] || u=$(command -v uv 2>/dev/null || true)
+    [[ -x "$u" ]] || { [[ -x "${HOME}/.local/bin/uv" ]] && u="${HOME}/.local/bin/uv"; }
+    [[ -x "$u" ]] || { [[ -x "${HOME}/.cargo/bin/uv" ]] && u="${HOME}/.cargo/bin/uv"; }
+    echo "$u"
+}
+
+POETRY_BIN=$(command -v poetry 2>/dev/null || true)
+[[ -x "$POETRY_BIN" ]] || { [[ -x "${HOME}/.local/bin/poetry" ]] && POETRY_BIN="${HOME}/.local/bin/poetry"; }
+
+if [[ -z "$POETRY_BIN" || ! -x "$POETRY_BIN" ]]; then
+    log "Installing Poetry…"
+    UV=$(resolve_uv)
+    if [[ -x "$UV" ]]; then
+        "$UV" tool install poetry 2>&1 | tail -3 || true
+    fi
+    POETRY_BIN=$(command -v poetry 2>/dev/null || true)
+    [[ -x "$POETRY_BIN" ]] || { [[ -x "${HOME}/.local/bin/poetry" ]] && POETRY_BIN="${HOME}/.local/bin/poetry"; }
+    # Fallback: official installer
+    if [[ -z "$POETRY_BIN" || ! -x "$POETRY_BIN" ]]; then
+        curl -sSL https://install.python-poetry.org | "${OH_PYTHON}" - 2>&1 | tail -3 || true
+        [[ -x "${HOME}/.local/bin/poetry" ]] && POETRY_BIN="${HOME}/.local/bin/poetry"
+    fi
+fi
+[[ -x "$POETRY_BIN" ]] || die "Could not install Poetry. Install manually: curl -sSL https://install.python-poetry.org | python3 -"
+export PATH="$(dirname "$POETRY_BIN"):${PATH}"
+ok "Poetry: $("$POETRY_BIN" --version 2>&1)"
+
+# --- Create the Poetry environment with the compatible Python ---
+cd "${OPENHANDS_DIR}"
+log "Pointing Poetry at ${OH_PYTHON} ($($OH_PYTHON --version))…"
+"$POETRY_BIN" env use "${OH_PYTHON}" 2>&1 | tail -2
+
+log "Running 'poetry install --with evaluation' (heavy — several minutes, pulls git deps)…"
+retry 3 30 "$POETRY_BIN" install --with evaluation
+
+# --- Resolve the Poetry venv python and record it for steps 9/10 ---
+POETRY_VENV_PATH=$("$POETRY_BIN" env info --path 2>/dev/null)
+VENV_PYTHON="${POETRY_VENV_PATH}/bin/python"
+[[ -x "$VENV_PYTHON" ]] || die "Poetry venv python not found at ${VENV_PYTHON}"
+echo "${VENV_PYTHON}"  > "${OPENHANDS_DIR}/.venv_python"
+echo "${POETRY_BIN}"   > "${SCRIPT_DIR}/../results/.poetry_bin"
+ok "OpenHands installed. Poetry venv python: ${VENV_PYTHON} ($(${VENV_PYTHON} --version))"
+
+# Sanity: confirm swebench (scoring tool, from evaluation group) is importable
+if "${VENV_PYTHON}" -c "import swebench" 2>/dev/null; then
+    ok "swebench package importable (scoring will work)"
 else
-    EXISTING_VER=$("${VENV_PYTHON}" --version 2>&1)
-    ok "venv already exists (${EXISTING_VER})"
+    warn "swebench not importable — scoring in step 10 may fail (eval group install incomplete)"
 fi
 
-# Store the venv python path so other scripts can source it
-echo "${VENV_PYTHON}" > "${OPENHANDS_DIR}/.venv_python"
-
 # ---------------------------------------------------------------------------
-# Install OpenHands inside the venv
+# Install TerminalBench into the EVAL venv (decoupled from OpenHands' poetry
+# env to avoid dependency conflicts).  'tb' orchestrates Docker on the host;
+# it does not need to share OpenHands' environment.
 # ---------------------------------------------------------------------------
-log "Installing OpenHands inside venv (this takes several minutes)…"
-cd "${OPENHANDS_DIR}"
-
-"${VENV_PIP}" install --upgrade pip wheel --quiet
-
-retry 3 30 \
-    "${VENV_PIP}" install -e ".[llms]" --quiet
-
-# Evaluation extras
-for req in \
-    "evaluation/benchmarks/swe_bench/requirements.txt" \
-    "evaluation/requirements.txt"; do
-    [[ -f "$req" ]] && \
-        "${VENV_PIP}" install -r "$req" --quiet || true
-done
-
-"${VENV_PIP}" install --quiet \
-    "datasets>=2.19.0" \
-    "huggingface_hub[cli]>=0.24.0" \
-    "openai>=1.35.0"
-
-# ---------------------------------------------------------------------------
-# Install TerminalBench into the venv
-# ---------------------------------------------------------------------------
-log "Installing terminal-bench…"
+EVAL_PY=$(eval_python)
+EVAL_PIP="$(dirname "$EVAL_PY")/pip"
+TB_BIN="$(dirname "$EVAL_PY")/tb"
+log "Installing terminal-bench into eval venv ($EVAL_PY)…"
 retry 3 15 \
-    "${VENV_PIP}" install --quiet \
+    "${EVAL_PIP}" install --quiet \
         "git+https://github.com/harbor-framework/terminal-bench.git" || \
     warn "terminal-bench install failed — will retry at run time"
 
-TB_BIN="${VENV_DIR}/bin/tb"
 if [[ -x "$TB_BIN" ]]; then
+    echo "${TB_BIN}" > "${SCRIPT_DIR}/../results/.tb_bin"
     ok "terminal-bench installed: $("${TB_BIN}" --version 2>/dev/null || echo 'version unknown')"
 else
-    warn "'tb' not found in venv — may need manual install"
+    warn "'tb' not found in eval venv — step 9 will retry installation"
 fi
 
 # ---------------------------------------------------------------------------
@@ -156,6 +210,7 @@ mkdir -p "${RESULTS_DIR}/${RUN_TAG}/openhands_workspace"
 ok "config.toml written"
 
 ok "=== OpenHands setup complete ==="
-log "OpenHands dir:  ${OPENHANDS_DIR}"
-log "Python venv:    ${VENV_PYTHON}"
-log "tb binary:      ${TB_BIN}"
+log "OpenHands dir:    ${OPENHANDS_DIR}"
+log "Poetry binary:    ${POETRY_BIN}"
+log "Poetry venv py:   ${VENV_PYTHON}"
+log "tb binary:        ${TB_BIN}  (eval venv)"

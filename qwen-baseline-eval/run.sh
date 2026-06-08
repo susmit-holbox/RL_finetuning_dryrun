@@ -74,11 +74,13 @@ run_step  4  "04_start_vllm.sh"     "Start vLLM server"
 
 # Tool-call test (non-fatal: Qwen2.5-Coder may fail silently — we log and continue)
 banner "Step 5: Tool-call endpoint test"
+# Resolve eval venv python (written by step 1)
+_EVAL_PY=$(cat "${REPO_DIR}/results/.eval_python" 2>/dev/null || command -v python3)
 VLLM_BASE_URL="http://localhost:${VLLM_PORT}/v1" \
 MODEL_NAME="${MODEL_NAME}" \
 RESULTS_DIR="${RESULTS_DIR}" \
 RUN_TAG="${RUN_TAG}" \
-python3 "${SCRIPT_DIR}/05_test_toolcall.py" && ok "Step 5 done (tool calls OK)" || {
+"${_EVAL_PY}" "${SCRIPT_DIR}/05_test_toolcall.py" && ok "Step 5 done (tool calls OK)" || {
     TC_EXIT=$?
     if (( TC_EXIT == 1 )); then
         echo -e "\033[0;33m[run.sh] ⚠ Tool calls not populated (parser issue) — proceeding with eval\033[0m"
@@ -91,6 +93,7 @@ run_step  6  "06_setup_openhands.sh" "Install OpenHands + TerminalBench"
 run_step  7  "07_setup_registry.sh"  "Local Docker registry (rate-limit cache)"
 
 banner "Step 8: Pre-pull SWE-bench Docker images"
+_EVAL_PY=$(cat "${REPO_DIR}/results/.eval_python" 2>/dev/null || command -v python3)
 SWEBENCH_DATASET="${SWEBENCH_DATASET}" \
 SWEBENCH_SPLIT="${SWEBENCH_SPLIT}" \
 RESULTS_DIR="${RESULTS_DIR}" \
@@ -99,7 +102,7 @@ DOCKER_USERNAME="${DOCKER_USERNAME:-}" \
 DOCKER_PASSWORD="${DOCKER_PASSWORD:-}" \
 LOCAL_REGISTRY_PORT="${LOCAL_REGISTRY_PORT}" \
 ECR_REGISTRY="${ECR_REGISTRY:-}" \
-python3 "${SCRIPT_DIR}/08_pull_images.py"
+"${_EVAL_PY}" "${SCRIPT_DIR}/08_pull_images.py"
 ok "Step 8 done"
 
 run_step  9  "09_run_terminalbench.sh" "TerminalBench evaluation"

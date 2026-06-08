@@ -132,6 +132,34 @@ docker_host_ip() {
 }
 
 # ---------------------------------------------------------------------------
+# Python helpers
+# eval_python  → venv python for vLLM/tools  (any python3 ≥3.10, incl 3.14)
+# oh_python    → venv python for OpenHands   (python3.12/3.13 only)
+# ---------------------------------------------------------------------------
+eval_python() {
+    local venv_file="${SCRIPT_DIR}/../results/.eval_python"
+    if [[ -f "$venv_file" ]]; then
+        cat "$venv_file"
+    elif [[ -x "${EVAL_VENV_DIR:-}/bin/python" ]]; then
+        echo "${EVAL_VENV_DIR}/bin/python"
+    else
+        command -v python3
+    fi
+}
+
+oh_python() {
+    local oh_dir="${OPENHANDS_DIR:-${HOME}/OpenHands}"
+    local venv_file="${oh_dir}/.venv_python"
+    if [[ -f "$venv_file" ]]; then
+        cat "$venv_file"
+    elif [[ -x "${oh_dir}/.venv/bin/python" ]]; then
+        echo "${oh_dir}/.venv/bin/python"
+    else
+        command -v python3.12 2>/dev/null || command -v python3.13 2>/dev/null || command -v python3
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # GPU helpers
 # ---------------------------------------------------------------------------
 detect_gpu_count() {

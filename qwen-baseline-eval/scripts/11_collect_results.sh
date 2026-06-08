@@ -13,7 +13,7 @@ ARCHIVE_PATH="${RESULTS_DIR}/${ARCHIVE_NAME}"
 # ---------------------------------------------------------------------------
 # Create a top-level summary
 # ---------------------------------------------------------------------------
-PYTHON=$(command -v python3 || command -v python)
+PYTHON=$(eval_python)
 $PYTHON - <<PYSUM
 import json
 from pathlib import Path

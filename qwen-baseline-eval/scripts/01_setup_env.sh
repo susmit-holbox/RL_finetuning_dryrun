@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # 01_setup_env.sh — Bootstrap a fresh Ubuntu EC2 GPU instance.
-# Installs: system packages, pip, python3.12, Docker CE, CUDA check.
-# Safe to re-run — all installs are idempotent.
+#
+# PEP 668 note: Ubuntu 24.04 marks the system Python as "externally managed",
+# meaning `pip install` on it is blocked.  This script NEVER installs packages
+# into the system Python.  Instead it creates a project-level virtual
+# environment (EVAL_VENV_DIR) for vLLM + evaluation tools, and a separate
+# python3.12 venv for OpenHands (step 6).
+#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,13 +15,15 @@ load_config
 
 log "=== Step 1: Environment setup ==="
 
+export DEBIAN_FRONTEND=noninteractive
+
 # ---------------------------------------------------------------------------
-# 1. GPU / nvidia-smi
+# 1. GPU check
 # ---------------------------------------------------------------------------
 NVIDIA_SMI=""
 for p in nvidia-smi /usr/bin/nvidia-smi /usr/local/bin/nvidia-smi \
           /opt/nvidia/bin/nvidia-smi; do
-    if [[ -x "$p" ]] || command -v "$p" &>/dev/null; then
+    if command -v "$p" &>/dev/null || [[ -x "$p" ]]; then
         NVIDIA_SMI=$(command -v "$p" 2>/dev/null || echo "$p")
         break
     fi
@@ -28,15 +35,14 @@ if [[ -z "$NVIDIA_SMI" ]]; then
         warn "Install NVIDIA drivers before Step 4: sudo ubuntu-drivers autoinstall && sudo reboot"
     else
         die "$(cat <<'MSG'
-nvidia-smi not found. To fix on Ubuntu EC2:
+nvidia-smi not found. On Ubuntu EC2:
 
   sudo apt-get update
   sudo apt-get install -y ubuntu-drivers-common
   sudo ubuntu-drivers autoinstall
   sudo reboot
 
-After reboot re-run: bash run.sh
-To skip this check: SKIP_GPU_CHECK=1 bash run.sh
+Or skip this check: SKIP_GPU_CHECK=1 bash run.sh
 MSG
 )"
     fi
@@ -48,86 +54,83 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2. apt packages — everything needed for this pipeline
+# 2. System packages — use apt only, never pip on system Python
 # ---------------------------------------------------------------------------
-log "Updating apt and installing system packages…"
-export DEBIAN_FRONTEND=noninteractive
-sudo apt-get update -qq
+log "Installing system packages via apt…"
+sudo apt-get update -qq 2>/dev/null
 
-# Core tools
 sudo apt-get install -y -qq \
     git curl wget screen htop jq pciutils \
     build-essential libssl-dev libffi-dev \
     ca-certificates gnupg lsb-release \
-    2>/dev/null
+    python3 python3-venv python3-full \
+    2>/dev/null || true
 
-# Python 3 base + pip (pip is NOT included by default on some Ubuntu images)
-sudo apt-get install -y -qq \
-    python3 python3-pip python3-venv python3-dev \
-    2>/dev/null
-
-# Python 3.12 (required by OpenHands — system python may be 3.14 which OpenHands rejects)
+# python3.12 (required by OpenHands; system Python may be 3.14)
 if ! command -v python3.12 &>/dev/null; then
-    log "Installing python3.12…"
-    # Ubuntu 22.04/24.04: add deadsnakes PPA for python3.12 if not in default repos
+    log "Installing python3.12 via apt…"
     if ! apt-cache show python3.12 &>/dev/null 2>&1; then
-        sudo apt-get install -y -qq software-properties-common 2>/dev/null
-        sudo add-apt-repository -y ppa:deadsnakes/ppa 2>/dev/null
-        sudo apt-get update -qq
+        sudo apt-get install -y -qq software-properties-common 2>/dev/null || true
+        sudo add-apt-repository -y ppa:deadsnakes/ppa 2>/dev/null || true
+        sudo apt-get update -qq 2>/dev/null
     fi
     sudo apt-get install -y -qq python3.12 python3.12-venv python3.12-dev 2>/dev/null || \
-        warn "python3.12 install failed — OpenHands step will try to fall back to python3.13"
+        warn "python3.12 install failed — OpenHands step will try python3.13"
 fi
-command -v python3.12 &>/dev/null && ok "python3.12: $(python3.12 --version)"
+command -v python3.12 &>/dev/null && ok "python3.12: $(python3.12 --version)" || true
 
 # ---------------------------------------------------------------------------
-# 3. Ensure pip works (bootstrap if python3-pip package was unavailable)
-# ---------------------------------------------------------------------------
-PYTHON=$(command -v python3)
-if ! "$PYTHON" -m pip --version &>/dev/null 2>&1; then
-    log "pip not found — bootstrapping via get-pip.py…"
-    curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
-    "$PYTHON" /tmp/get-pip.py --quiet
-    rm -f /tmp/get-pip.py
-fi
-ok "pip: $("$PYTHON" -m pip --version)"
-
-log "Upgrading pip/wheel/setuptools…"
-"$PYTHON" -m pip install --upgrade pip wheel setuptools --quiet
-
-# ---------------------------------------------------------------------------
-# 4. Docker CE
+# 3. Docker CE
 # ---------------------------------------------------------------------------
 if ! command -v docker &>/dev/null; then
     log "Installing Docker CE…"
-    # Official Docker install script (handles Ubuntu 22.04 and 24.04)
-    curl -fsSL https://get.docker.com | sudo sh 2>/dev/null || {
-        # Fallback: distro package
+    curl -fsSL https://get.docker.com | sudo sh 2>/dev/null || \
         sudo apt-get install -y -qq docker.io 2>/dev/null || true
-    }
 fi
 
-# Start + enable Docker
-if ! docker info &>/dev/null 2>&1; then
-    sudo systemctl enable docker 2>/dev/null || true
-    sudo systemctl start  docker 2>/dev/null || \
-    sudo service docker start     2>/dev/null || true
-    sleep 4
-fi
+sudo systemctl enable docker 2>/dev/null || true
+sudo systemctl start  docker 2>/dev/null || \
+    sudo service docker start 2>/dev/null || true
+sleep 3
 
 if docker info &>/dev/null 2>&1; then
     ok "Docker: $(docker --version)"
 else
-    warn "Docker not running after install attempt."
-    warn "Run manually: sudo systemctl start docker"
-    warn "Steps 1-6 (vLLM, model download, OpenHands) will still proceed."
+    warn "Docker not running — steps 7-10 (image pull + eval) will fail."
+    warn "Fix: sudo systemctl start docker"
 fi
 
-# Add user to docker group
 if command -v docker &>/dev/null && ! groups "$USER" | grep -q docker; then
     sudo usermod -aG docker "$USER" 2>/dev/null || true
-    warn "Added $USER to docker group — run 'newgrp docker' or re-login before running Docker commands"
+    warn "Added $USER to docker group — run 'newgrp docker' before docker commands"
 fi
+
+# ---------------------------------------------------------------------------
+# 4. Create project eval venv (avoids PEP 668 on system Python)
+#
+# This venv is used by ALL steps that need Python packages (vLLM, HF tools,
+# datasets, boto3).  It uses the system python3 which may be 3.14 — that is
+# fine for vLLM (supports 3.10-3.14) and general tools.
+#
+# OpenHands uses a SEPARATE venv with python3.12 (step 6).
+# ---------------------------------------------------------------------------
+SYS_PYTHON=$(command -v python3)
+log "System Python: $($SYS_PYTHON --version)"
+
+if [[ ! -x "${EVAL_VENV_DIR}/bin/python" ]]; then
+    log "Creating eval venv at ${EVAL_VENV_DIR}…"
+    "$SYS_PYTHON" -m venv "${EVAL_VENV_DIR}"
+    ok "Eval venv created"
+else
+    ok "Eval venv already exists: $(${EVAL_VENV_DIR}/bin/python --version)"
+fi
+
+# Upgrade pip INSIDE the venv (safe — venv pip is isolated from system Python)
+"${EVAL_VENV_DIR}/bin/pip" install --upgrade pip wheel setuptools --quiet
+ok "Venv pip: $(${EVAL_VENV_DIR}/bin/pip --version)"
+
+# Write venv path for downstream scripts
+echo "${EVAL_VENV_DIR}/bin/python" > "${SCRIPT_DIR}/../results/.eval_python"
 
 # ---------------------------------------------------------------------------
 # 5. Results directory
@@ -137,3 +140,5 @@ ok "Results dir: ${RESULTS_DIR}/${RUN_TAG}"
 echo "RUN_TAG=${RUN_TAG}" > "${SCRIPT_DIR}/../results/.run_tag"
 
 ok "=== Environment setup complete ==="
+log "Eval venv: ${EVAL_VENV_DIR}"
+log "Use this Python for all steps: ${EVAL_VENV_DIR}/bin/python"

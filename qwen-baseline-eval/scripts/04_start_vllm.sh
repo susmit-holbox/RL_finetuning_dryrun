@@ -15,9 +15,10 @@ load_config
 
 log "=== Step 4: Start vLLM server ==="
 
-PYTHON=$(command -v python3 || command -v python)
-VLLM_BIN=$(command -v vllm || $PYTHON -m vllm --help &>/dev/null && echo "$PYTHON -m vllm" || true)
-[[ -z "$VLLM_BIN" ]] && VLLM_BIN="vllm"
+PYTHON=$(eval_python)
+# vllm is installed into the eval venv
+VLLM_BIN="$(dirname "$PYTHON")/vllm"
+[[ -x "$VLLM_BIN" ]] || VLLM_BIN="$PYTHON -m vllm"
 
 # ---------------------------------------------------------------------------
 # Already running?
@@ -82,7 +83,7 @@ VLLM_CMD="vllm serve ${MODEL_ID} \
     ${VLLM_EXTRA_FLAGS:-}"
 
 # Pass HF_HOME so vLLM finds cached weights
-VLLM_ENV="HF_HOME=${HF_HOME}"
+VLLM_ENV="HF_HOME=${HF_HOME} PATH=$(dirname "$PYTHON"):\$PATH"
 [[ -n "${HF_TOKEN:-}" ]] && VLLM_ENV="${VLLM_ENV} HF_TOKEN=${HF_TOKEN}"
 
 log "Starting vLLM in screen '${VLLM_SCREEN}'…"

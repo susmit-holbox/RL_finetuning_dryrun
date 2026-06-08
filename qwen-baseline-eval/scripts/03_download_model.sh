@@ -6,7 +6,7 @@ load_config
 
 log "=== Step 3: Download model ${MODEL_ID} ==="
 
-PYTHON=$(command -v python3 || command -v python)
+PYTHON=$(eval_python)
 
 # ---------------------------------------------------------------------------
 # Configure HuggingFace cache

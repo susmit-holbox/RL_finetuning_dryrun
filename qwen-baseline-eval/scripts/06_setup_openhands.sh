@@ -1,26 +1,56 @@
 #!/usr/bin/env bash
 # 06_setup_openhands.sh — Clone and install OpenHands + evaluation dependencies.
+#
+# OpenHands 0.62.0 requires Python >=3.12,<3.14.
+# This script creates a dedicated Python 3.12/3.13 virtual environment for
+# OpenHands, separate from the system Python used for vLLM (which may be 3.14+).
+# The venv is written to ${OPENHANDS_DIR}/.venv and its Python path is stored in
+# ${OPENHANDS_DIR}/.venv_python for use by evaluation runner scripts.
+#
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib.sh"
 load_config
 
 log "=== Step 6: Setup OpenHands ==="
 
-PYTHON=$(command -v python3 || command -v python)
+# ---------------------------------------------------------------------------
+# Find Python 3.12 or 3.13 (OpenHands requires >=3.12,<3.14)
+# ---------------------------------------------------------------------------
+OH_PYTHON=""
+for candidate in python3.12 python3.13; do
+    if command -v "$candidate" &>/dev/null; then
+        ver=$($candidate --version 2>&1 | awk '{print $2}')
+        minor=$(echo "$ver" | cut -d. -f2)
+        if (( minor >= 12 && minor <= 13 )); then
+            OH_PYTHON=$(command -v "$candidate")
+            log "Found compatible Python for OpenHands: ${OH_PYTHON} (${ver})"
+            break
+        fi
+    fi
+done
+
+if [[ -z "$OH_PYTHON" ]]; then
+    # Try to install python3.12 via apt (Ubuntu/Debian GPU instances)
+    warn "No Python 3.12/3.13 found. Attempting to install python3.12…"
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get install -y -qq python3.12 python3.12-venv 2>/dev/null && \
+            OH_PYTHON=$(command -v python3.12) || true
+    fi
+    [[ -z "$OH_PYTHON" ]] && die \
+        "OpenHands requires Python 3.12 or 3.13 (not 3.14+). Install with:\n  sudo apt install python3.12 python3.12-venv\nor use pyenv/conda."
+fi
 
 # ---------------------------------------------------------------------------
-# Clone OpenHands
+# Clone OpenHands (pin to 0.62.0 — last tag with evaluation/)
 # ---------------------------------------------------------------------------
-# Pin to 0.62.0 — the last tag that includes evaluation/benchmarks/swe_bench/
-# The evaluation directory was removed from main after this tag.
 OPENHANDS_TAG="0.62.0"
 
 if [[ -d "${OPENHANDS_DIR}/.git" ]]; then
     CURRENT_TAG=$(git -C "${OPENHANDS_DIR}" describe --tags --exact-match 2>/dev/null || echo "unknown")
     if [[ "$CURRENT_TAG" == "$OPENHANDS_TAG" ]]; then
-        ok "OpenHands ${OPENHANDS_TAG} already checked out at ${OPENHANDS_DIR}"
+        ok "OpenHands ${OPENHANDS_TAG} already at ${OPENHANDS_DIR}"
     else
-        log "Existing checkout is ${CURRENT_TAG} — re-cloning to pin ${OPENHANDS_TAG}…"
+        log "Existing checkout is '${CURRENT_TAG}', re-cloning to ${OPENHANDS_TAG}…"
         rm -rf "${OPENHANDS_DIR}"
         retry 3 15 \
             git clone --depth 1 --branch "${OPENHANDS_TAG}" \
@@ -35,61 +65,75 @@ else
             "${OPENHANDS_DIR}"
 fi
 
-# Verify the evaluation runner exists
 [[ -f "${OPENHANDS_DIR}/evaluation/benchmarks/swe_bench/run_infer.py" ]] || \
-    die "run_infer.py not found after clone — clone may have failed"
-ok "run_infer.py present"
+    die "run_infer.py not found — clone of ${OPENHANDS_TAG} may have failed"
+ok "run_infer.py and run_infer.sh present"
 
 # ---------------------------------------------------------------------------
-# Install OpenHands + evaluation extras
+# Create / reuse a dedicated venv with the compatible Python
 # ---------------------------------------------------------------------------
-log "Installing OpenHands Python package…"
+VENV_DIR="${OPENHANDS_DIR}/.venv"
+VENV_PYTHON="${VENV_DIR}/bin/python"
+VENV_PIP="${VENV_DIR}/bin/pip"
+
+if [[ ! -x "${VENV_PYTHON}" ]]; then
+    log "Creating OpenHands venv at ${VENV_DIR} using ${OH_PYTHON}…"
+    "${OH_PYTHON}" -m venv "${VENV_DIR}"
+    ok "venv created"
+else
+    EXISTING_VER=$("${VENV_PYTHON}" --version 2>&1)
+    ok "venv already exists (${EXISTING_VER})"
+fi
+
+# Store the venv python path so other scripts can source it
+echo "${VENV_PYTHON}" > "${OPENHANDS_DIR}/.venv_python"
+
+# ---------------------------------------------------------------------------
+# Install OpenHands inside the venv
+# ---------------------------------------------------------------------------
+log "Installing OpenHands inside venv (this takes several minutes)…"
 cd "${OPENHANDS_DIR}"
 
-# Core install
+"${VENV_PIP}" install --upgrade pip wheel --quiet
+
 retry 3 30 \
-    $PYTHON -m pip install -e ".[llms]" --quiet \
+    "${VENV_PIP}" install -e ".[llms]" --quiet \
     2>&1 | grep -v "^Requirement already"
 
-# Evaluation benchmarks have their own requirements
-if [[ -f "evaluation/benchmarks/swe_bench/requirements.txt" ]]; then
-    $PYTHON -m pip install -r evaluation/benchmarks/swe_bench/requirements.txt --quiet \
-        2>&1 | grep -v "^Requirement already" || true
-fi
-if [[ -f "evaluation/requirements.txt" ]]; then
-    $PYTHON -m pip install -r evaluation/requirements.txt --quiet \
-        2>&1 | grep -v "^Requirement already" || true
-fi
+# Evaluation extras
+for req in \
+    "evaluation/benchmarks/swe_bench/requirements.txt" \
+    "evaluation/requirements.txt"; do
+    [[ -f "$req" ]] && \
+        "${VENV_PIP}" install -r "$req" --quiet \
+            2>&1 | grep -v "^Requirement already" || true
+done
 
-# datasets is needed to enumerate SWE-bench instances
-$PYTHON -m pip install --quiet "datasets>=2.19.0" "huggingface_hub[cli]>=0.24.0"
+"${VENV_PIP}" install --quiet \
+    "datasets>=2.19.0" \
+    "huggingface_hub[cli]>=0.24.0" \
+    "openai>=1.35.0" \
+    2>&1 | grep -v "^Requirement already"
 
 # ---------------------------------------------------------------------------
-# Install TerminalBench (terminal-bench)
+# Install TerminalBench into the venv
 # ---------------------------------------------------------------------------
 log "Installing terminal-bench…"
 retry 3 15 \
-    $PYTHON -m pip install --quiet \
+    "${VENV_PIP}" install --quiet \
         "git+https://github.com/harbor-framework/terminal-bench.git" \
     2>&1 | grep -v "^Requirement already" || \
     warn "terminal-bench install failed — will retry at run time"
 
-if command -v tb &>/dev/null; then
-    ok "terminal-bench (tb) installed: $(tb --version 2>/dev/null || echo 'version unknown')"
+TB_BIN="${VENV_DIR}/bin/tb"
+if [[ -x "$TB_BIN" ]]; then
+    ok "terminal-bench installed: $("${TB_BIN}" --version 2>/dev/null || echo 'version unknown')"
 else
-    warn "'tb' command not found in PATH — terminal-bench may not be installed"
+    warn "'tb' not found in venv — may need manual install"
 fi
 
 # ---------------------------------------------------------------------------
 # Write OpenHands config.toml
-# The evaluation runner reads LLM settings from config.toml using the
-# [llm.<name>] section format.  We write an 'eval_model' section that the
-# run_infer.py script can reference via --llm-config eval_model.
-#
-# On Linux, vLLM runs on the HOST so the correct URL for the evaluation
-# runner (which also runs on the host) is localhost:<port>.
-# TerminalBench containers need the Docker bridge gateway IP instead —
-# that is set separately via LLM_BASE_URL env var in 09_run_terminalbench.sh
 # ---------------------------------------------------------------------------
 log "Writing OpenHands config.toml…"
 cat > "${OPENHANDS_DIR}/config.toml" <<TOML
@@ -112,10 +156,10 @@ retry_max_wait = 60
 max_iterations = ${OPENHANDS_MAX_ITER}
 TOML
 
-ok "config.toml written to ${OPENHANDS_DIR}/config.toml"
-
-# Create workspace directory
 mkdir -p "${RESULTS_DIR}/${RUN_TAG}/openhands_workspace"
+ok "config.toml written"
 
 ok "=== OpenHands setup complete ==="
-log "OpenHands dir: ${OPENHANDS_DIR}"
+log "OpenHands dir:  ${OPENHANDS_DIR}"
+log "Python venv:    ${VENV_PYTHON}"
+log "tb binary:      ${TB_BIN}"

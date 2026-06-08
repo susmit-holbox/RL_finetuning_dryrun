@@ -14,16 +14,29 @@ load_config
 
 log "=== Step 9: TerminalBench evaluation ==="
 
-PYTHON=$(command -v python3 || command -v python)
+# Use the OpenHands venv (has tb and Python 3.12/3.13)
+VENV_PYTHON_FILE="${OPENHANDS_DIR}/.venv_python"
+if [[ -f "$VENV_PYTHON_FILE" ]]; then
+    VENV_PYTHON=$(cat "$VENV_PYTHON_FILE")
+    VENV_BIN=$(dirname "$VENV_PYTHON")
+    TB_BIN="${VENV_BIN}/tb"
+else
+    VENV_BIN=""
+    TB_BIN=$(command -v tb 2>/dev/null || echo "tb")
+fi
+PYTHON="${VENV_PYTHON:-$(command -v python3)}"
 
 # ---------------------------------------------------------------------------
 # Pre-flight checks
 # ---------------------------------------------------------------------------
-if ! command -v tb &>/dev/null; then
+if [[ ! -x "$TB_BIN" ]] && ! command -v tb &>/dev/null; then
     warn "'tb' not found — trying to install terminal-bench…"
-    $PYTHON -m pip install --quiet \
+    pip_cmd="${VENV_BIN:+${VENV_BIN}/pip}"
+    ${pip_cmd:-pip3} install --quiet \
         "git+https://github.com/harbor-framework/terminal-bench.git" || \
         die "terminal-bench installation failed"
+    TB_BIN="${VENV_BIN:+${VENV_BIN}/tb}"
+    TB_BIN="${TB_BIN:-$(command -v tb)}"
 fi
 
 if ! curl -sf "http://localhost:${VLLM_PORT}/health" &>/dev/null; then
@@ -83,7 +96,7 @@ export LLM_BASE_URL="${CONTAINER_LLM_BASE_URL}"
 export LLM_API_KEY="${OPENHANDS_LLM_API_KEY}"
 export LLM_MODEL="openai/${MODEL_NAME}"
 
-tb run \
+"${TB_BIN:-tb}" run \
     --dataset-name "${TERMINALBENCH_DATASET}" \
     --dataset-version "${TERMINALBENCH_VERSION}" \
     --agent openhands \

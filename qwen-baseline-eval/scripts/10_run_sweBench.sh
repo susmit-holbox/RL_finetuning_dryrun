@@ -15,7 +15,13 @@ load_config
 
 log "=== Step 10: SWE-bench evaluation ==="
 
-PYTHON=$(command -v python3 || command -v python)
+# Use the OpenHands venv Python (requires Python 3.12/3.13, not 3.14)
+VENV_PYTHON_FILE="${OPENHANDS_DIR}/.venv_python"
+if [[ -f "$VENV_PYTHON_FILE" ]]; then
+    PYTHON=$(cat "$VENV_PYTHON_FILE")
+else
+    PYTHON=$(command -v python3.12 || command -v python3.13 || command -v python3)
+fi
 
 # ---------------------------------------------------------------------------
 # Pre-flight checks

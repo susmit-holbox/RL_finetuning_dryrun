@@ -133,14 +133,15 @@ fi
 ok "Venv pip: $(${EVAL_VENV_DIR}/bin/pip --version)"
 
 # Write venv path for downstream scripts
+mkdir -p "${SCRIPT_DIR}/../results"
 echo "${EVAL_VENV_DIR}/bin/python" > "${SCRIPT_DIR}/../results/.eval_python"
+echo "RUN_TAG=${RUN_TAG}" > "${SCRIPT_DIR}/../results/.run_tag"
 
 # ---------------------------------------------------------------------------
 # 5. Results directory
 # ---------------------------------------------------------------------------
 mkdir -p "${RESULTS_DIR}/${RUN_TAG}"
 ok "Results dir: ${RESULTS_DIR}/${RUN_TAG}"
-echo "RUN_TAG=${RUN_TAG}" > "${SCRIPT_DIR}/../results/.run_tag"
 
 ok "=== Environment setup complete ==="
 log "Eval venv: ${EVAL_VENV_DIR}"

@@ -17,6 +17,7 @@ if [[ ! -x "$PYTHON" ]]; then
     log "Eval venv not found — creating at ${EVAL_VENV_DIR}…"
     python3 -m venv "${EVAL_VENV_DIR}"
     "${EVAL_VENV_DIR}/bin/pip" install --upgrade pip wheel setuptools --quiet
+    mkdir -p "${SCRIPT_DIR}/../results"
     echo "${EVAL_VENV_DIR}/bin/python" > "${SCRIPT_DIR}/../results/.eval_python"
     PYTHON=$(eval_python)
     PIP=$(dirname "$PYTHON")/pip

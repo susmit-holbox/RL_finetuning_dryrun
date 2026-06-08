@@ -13,6 +13,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib.sh"
 load_config
 
+# Safety net: config.env may be an older version that predates EVAL_VENV_DIR
+EVAL_VENV_DIR="${EVAL_VENV_DIR:-${HOME}/eval_venv}"
+
 log "=== Step 1: Environment setup ==="
 
 export DEBIAN_FRONTEND=noninteractive

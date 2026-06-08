@@ -97,23 +97,20 @@ cd "${OPENHANDS_DIR}"
 "${VENV_PIP}" install --upgrade pip wheel --quiet
 
 retry 3 30 \
-    "${VENV_PIP}" install -e ".[llms]" --quiet \
-    2>&1 | grep -v "^Requirement already"
+    "${VENV_PIP}" install -e ".[llms]" --quiet
 
 # Evaluation extras
 for req in \
     "evaluation/benchmarks/swe_bench/requirements.txt" \
     "evaluation/requirements.txt"; do
     [[ -f "$req" ]] && \
-        "${VENV_PIP}" install -r "$req" --quiet \
-            2>&1 | grep -v "^Requirement already" || true
+        "${VENV_PIP}" install -r "$req" --quiet || true
 done
 
 "${VENV_PIP}" install --quiet \
     "datasets>=2.19.0" \
     "huggingface_hub[cli]>=0.24.0" \
-    "openai>=1.35.0" \
-    2>&1 | grep -v "^Requirement already"
+    "openai>=1.35.0"
 
 # ---------------------------------------------------------------------------
 # Install TerminalBench into the venv
@@ -121,8 +118,7 @@ done
 log "Installing terminal-bench…"
 retry 3 15 \
     "${VENV_PIP}" install --quiet \
-        "git+https://github.com/harbor-framework/terminal-bench.git" \
-    2>&1 | grep -v "^Requirement already" || \
+        "git+https://github.com/harbor-framework/terminal-bench.git" || \
     warn "terminal-bench install failed — will retry at run time"
 
 TB_BIN="${VENV_DIR}/bin/tb"

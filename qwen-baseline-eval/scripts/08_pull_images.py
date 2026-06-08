@@ -126,9 +126,11 @@ def ecr_login() -> bool:
         return False
     region = "us-east-1"
     # Extract region from ECR URL if possible
+    # ECR URL: <account>.dkr.ecr.<region>.amazonaws.com/...
+    # split(".")  → ["<account>", "dkr", "ecr", "<region>", "amazonaws", ...]
     parts = ECR_REGISTRY.split(".")
-    if len(parts) >= 4 and parts[3] == "ecr":
-        region = parts[2]
+    if len(parts) >= 4 and parts[2] == "ecr":
+        region = parts[3]
     try:
         pw = subprocess.check_output(
             ["aws", "ecr", "get-login-password", "--region", region],

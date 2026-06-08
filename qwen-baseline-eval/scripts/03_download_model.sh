@@ -7,13 +7,19 @@ load_config
 log "=== Step 3: Download model ${MODEL_ID} ==="
 
 PYTHON=$(eval_python)
+HF_CLI="$(dirname "$PYTHON")/huggingface-cli"
 
 # ---------------------------------------------------------------------------
 # Configure HuggingFace cache
 # ---------------------------------------------------------------------------
 export HF_HOME="${HF_HOME:-/data/models}"
 export HUGGINGFACE_HUB_VERBOSITY="warning"
-mkdir -p "$HF_HOME"
+# Fall back to ~/models if the configured path isn't writable (e.g., no /data volume)
+if ! mkdir -p "${HF_HOME}" 2>/dev/null; then
+    HF_HOME="${HOME}/models"
+    warn "HF_HOME not writable — falling back to ${HF_HOME}"
+    mkdir -p "${HF_HOME}"
+fi
 
 # Model will land at: ${HF_HOME}/models--${ORG}--${NAME}/snapshots/...
 LOCAL_DIR="${HF_HOME}/models--$(echo "${MODEL_ID}" | tr '/' '--')"
@@ -31,7 +37,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ -n "${HF_TOKEN:-}" ]]; then
     log "Logging in to HuggingFace Hub…"
-    huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential 2>/dev/null || \
+    "${HF_CLI}" login --token "$HF_TOKEN" --add-to-git-credential 2>/dev/null || \
         $PYTHON -c "from huggingface_hub import login; login('${HF_TOKEN}')"
 fi
 
@@ -39,10 +45,10 @@ fi
 # Download
 # ---------------------------------------------------------------------------
 log "Downloading ${MODEL_ID} to ${HF_HOME}…"
-log "This may take a long time for large models (32B ≈ 60 GB)"
+log "This may take a long time for large models (14B ≈ 28 GB)"
 
 retry 3 30 \
-    huggingface-cli download \
+    "${HF_CLI}" download \
         "${MODEL_ID}" \
         --cache-dir "${HF_HOME}" \
         --local-dir-use-symlinks False \

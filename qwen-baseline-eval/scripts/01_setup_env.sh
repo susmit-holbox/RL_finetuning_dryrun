@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # 01_setup_env.sh — Bootstrap a fresh Ubuntu EC2 GPU instance.
 #
-# PEP 668 note: Ubuntu 24.04 marks the system Python as "externally managed",
-# meaning `pip install` on it is blocked.  This script NEVER installs packages
-# into the system Python.  Instead it creates a project-level virtual
-# environment (EVAL_VENV_DIR) for vLLM + evaluation tools, and a separate
-# python3.12 venv for OpenHands (step 6).
+# vLLM + PyTorch require Python 3.10–3.13.  Python 3.14+ has no torch wheels.
+# This script installs a compatible Python and creates the eval venv with it.
+# OpenHands uses a separate python3.12/3.13 venv (step 6).
 #
 set -euo pipefail
 
@@ -57,7 +55,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2. System packages — use apt only, never pip on system Python
+# 2. System packages
 # ---------------------------------------------------------------------------
 log "Installing system packages via apt…"
 sudo apt-get update -qq 2>/dev/null
@@ -69,18 +67,77 @@ sudo apt-get install -y -qq \
     python3 python3-venv python3-full \
     2>/dev/null || true
 
-# python3.12 (required by OpenHands; system Python may be 3.14)
-if ! command -v python3.12 &>/dev/null; then
-    log "Installing python3.12 via apt…"
-    if ! apt-cache show python3.12 &>/dev/null 2>&1; then
-        sudo apt-get install -y -qq software-properties-common 2>/dev/null || true
-        sudo add-apt-repository -y ppa:deadsnakes/ppa 2>/dev/null || true
-        sudo apt-get update -qq 2>/dev/null
-    fi
-    sudo apt-get install -y -qq python3.12 python3.12-venv python3.12-dev 2>/dev/null || \
-        warn "python3.12 install failed — OpenHands step will try python3.13"
+# ---------------------------------------------------------------------------
+# 2b. Install Python 3.12 or 3.13 — required for vLLM + PyTorch (no 3.14 wheels)
+#
+# Try in order:
+#   1. Already installed
+#   2. Direct apt (Ubuntu 24.04 main/universe repos)
+#   3. deadsnakes PPA
+#   4. Miniconda with python=3.12 (last resort)
+# ---------------------------------------------------------------------------
+_find_compat_python() {
+    for v in python3.12 python3.13 python3.11 python3.10; do
+        command -v "$v" &>/dev/null && { echo "$(command -v "$v")"; return 0; }
+    done
+    return 1
+}
+
+COMPAT_PYTHON=$(_find_compat_python || true)
+
+if [[ -z "$COMPAT_PYTHON" ]]; then
+    log "No Python 3.10–3.13 found; system has $(python3 --version). Attempting install…"
+
+    # Attempt 1: direct apt (no PPA needed on some Ubuntu versions)
+    for pyver in 3.12 3.13; do
+        if sudo apt-get install -y -qq "python${pyver}" "python${pyver}-venv" "python${pyver}-dev" 2>/dev/null; then
+            command -v "python${pyver}" &>/dev/null && {
+                COMPAT_PYTHON=$(command -v "python${pyver}")
+                log "Installed python${pyver} via apt"
+                break
+            }
+        fi
+    done
 fi
-command -v python3.12 &>/dev/null && ok "python3.12: $(python3.12 --version)" || true
+
+if [[ -z "$COMPAT_PYTHON" ]]; then
+    # Attempt 2: deadsnakes PPA
+    log "Trying deadsnakes PPA…"
+    sudo apt-get install -y -qq software-properties-common 2>/dev/null || true
+    sudo add-apt-repository -y ppa:deadsnakes/ppa 2>&1 | tail -3 || true
+    sudo apt-get update -qq 2>/dev/null
+    for pyver in 3.12 3.13; do
+        if sudo apt-get install -y -qq "python${pyver}" "python${pyver}-venv" "python${pyver}-dev" 2>/dev/null; then
+            command -v "python${pyver}" &>/dev/null && {
+                COMPAT_PYTHON=$(command -v "python${pyver}")
+                log "Installed python${pyver} via deadsnakes PPA"
+                break
+            }
+        fi
+    done
+fi
+
+if [[ -z "$COMPAT_PYTHON" ]]; then
+    # Attempt 3: Miniconda
+    warn "apt methods failed — installing Miniconda to get Python 3.12"
+    CONDA_DIR="${HOME}/miniconda3"
+    CONDA_INSTALLER="/tmp/miniconda_install.sh"
+    if [[ ! -x "${CONDA_DIR}/bin/conda" ]]; then
+        curl -fsSL "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh" \
+            -o "$CONDA_INSTALLER"
+        bash "$CONDA_INSTALLER" -b -p "${CONDA_DIR}"
+    fi
+    if [[ ! -x "${CONDA_DIR}/envs/eval312/bin/python" ]]; then
+        "${CONDA_DIR}/bin/conda" create -n eval312 python=3.12 -y -q
+    fi
+    COMPAT_PYTHON="${CONDA_DIR}/envs/eval312/bin/python"
+fi
+
+if [[ -z "$COMPAT_PYTHON" ]] || [[ ! -x "$COMPAT_PYTHON" ]]; then
+    die "Cannot find or install Python 3.10–3.13. PyTorch/vLLM have no wheels for $(python3 --version)."
+fi
+
+ok "Compatible Python for vLLM/torch: $($COMPAT_PYTHON --version) at ${COMPAT_PYTHON}"
 
 # ---------------------------------------------------------------------------
 # 3. Docker CE
@@ -109,26 +166,32 @@ if command -v docker &>/dev/null && ! groups "$USER" | grep -q docker; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Create project eval venv (avoids PEP 668 on system Python)
+# 4. Create eval venv using the compatible Python (3.12 or 3.13, NOT 3.14+)
 #
-# This venv is used by ALL steps that need Python packages (vLLM, HF tools,
-# datasets, boto3).  It uses the system python3 which may be 3.14 — that is
-# fine for vLLM (supports 3.10-3.14) and general tools.
-#
-# OpenHands uses a SEPARATE venv with python3.12 (step 6).
+# PyTorch CUDA wheels exist for cp310-cp313; cp314 is not yet published.
+# All vLLM + eval tool installs go into this venv.
+# OpenHands uses a SEPARATE venv (step 6).
 # ---------------------------------------------------------------------------
-SYS_PYTHON=$(command -v python3)
-log "System Python: $($SYS_PYTHON --version)"
+log "System Python: $(python3 --version)"
+log "Eval venv Python: $($COMPAT_PYTHON --version)"
 
 if [[ ! -x "${EVAL_VENV_DIR}/bin/python" ]]; then
     log "Creating eval venv at ${EVAL_VENV_DIR}…"
-    "$SYS_PYTHON" -m venv "${EVAL_VENV_DIR}"
+    "$COMPAT_PYTHON" -m venv "${EVAL_VENV_DIR}"
     ok "Eval venv created"
 else
-    ok "Eval venv already exists: $(${EVAL_VENV_DIR}/bin/python --version)"
+    EXISTING_VER=$("${EVAL_VENV_DIR}/bin/python" --version 2>&1)
+    # If existing venv is Python 3.14, recreate it with compatible Python
+    if echo "$EXISTING_VER" | grep -q "3\.14"; then
+        warn "Existing eval venv uses Python 3.14 (no torch wheels) — recreating with $($COMPAT_PYTHON --version)"
+        rm -rf "${EVAL_VENV_DIR}"
+        "$COMPAT_PYTHON" -m venv "${EVAL_VENV_DIR}"
+        ok "Eval venv recreated"
+    else
+        ok "Eval venv already exists: ${EXISTING_VER}"
+    fi
 fi
 
-# Upgrade pip INSIDE the venv (safe — venv pip is isolated from system Python)
 "${EVAL_VENV_DIR}/bin/pip" install --upgrade pip wheel setuptools --quiet
 ok "Venv pip: $(${EVAL_VENV_DIR}/bin/pip --version)"
 
@@ -144,5 +207,5 @@ mkdir -p "${RESULTS_DIR}/${RUN_TAG}"
 ok "Results dir: ${RESULTS_DIR}/${RUN_TAG}"
 
 ok "=== Environment setup complete ==="
-log "Eval venv: ${EVAL_VENV_DIR}"
+log "Eval venv: ${EVAL_VENV_DIR} ($($COMPAT_PYTHON --version))"
 log "Use this Python for all steps: ${EVAL_VENV_DIR}/bin/python"

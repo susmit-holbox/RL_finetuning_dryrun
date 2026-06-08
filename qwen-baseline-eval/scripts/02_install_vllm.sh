@@ -12,18 +12,40 @@ log "=== Step 2: Install vLLM ==="
 PYTHON=$(eval_python)
 PIP=$(dirname "$PYTHON")/pip
 
-# Ensure venv exists (in case step 1 was skipped or run separately)
-if [[ ! -x "$PYTHON" ]]; then
-    log "Eval venv not found — creating at ${EVAL_VENV_DIR}…"
-    python3 -m venv "${EVAL_VENV_DIR}"
-    "${EVAL_VENV_DIR}/bin/pip" install --upgrade pip wheel setuptools --quiet
-    mkdir -p "${SCRIPT_DIR}/../results"
-    echo "${EVAL_VENV_DIR}/bin/python" > "${SCRIPT_DIR}/../results/.eval_python"
-    PYTHON=$(eval_python)
-    PIP=$(dirname "$PYTHON")/pip
+# Ensure venv exists with a Python version that has torch wheels (3.10-3.13)
+_check_venv_python_ok() {
+    local py="$1"
+    [[ -x "$py" ]] || return 1
+    local minor
+    minor=$("$py" -c "import sys; print(sys.version_info.minor)" 2>/dev/null)
+    (( minor <= 13 ))
+}
+
+if ! _check_venv_python_ok "$PYTHON"; then
+    if _check_venv_python_ok "$PYTHON"; then
+        : # already OK
+    else
+        log "Eval venv missing or uses Python 3.14+ (no torch wheels) — creating with python3.12/3.13"
+        # Find compatible Python
+        COMPAT=""
+        for v in python3.12 python3.13 python3.11 python3.10; do
+            command -v "$v" &>/dev/null && { COMPAT=$(command -v "$v"); break; }
+        done
+        [[ -n "$COMPAT" ]] || die "No Python 3.10–3.13 found. Run step 1 first: bash scripts/01_setup_env.sh"
+        [[ -d "${EVAL_VENV_DIR}" ]] && rm -rf "${EVAL_VENV_DIR}"
+        "$COMPAT" -m venv "${EVAL_VENV_DIR}"
+        "${EVAL_VENV_DIR}/bin/pip" install --upgrade pip wheel setuptools --quiet
+        mkdir -p "${SCRIPT_DIR}/../results"
+        echo "${EVAL_VENV_DIR}/bin/python" > "${SCRIPT_DIR}/../results/.eval_python"
+        PYTHON=$(eval_python)
+        PIP=$(dirname "$PYTHON")/pip
+    fi
 fi
 
 log "Using Python: $PYTHON ($($PYTHON --version))"
+# Verify Python version is torch-compatible
+_MINOR=$("$PYTHON" -c "import sys; print(sys.version_info.minor)")
+(( _MINOR >= 10 && _MINOR <= 13 )) || die "Python 3.${_MINOR} in eval venv has no PyTorch CUDA wheels. Re-run step 1."
 
 # ---------------------------------------------------------------------------
 # Already installed?

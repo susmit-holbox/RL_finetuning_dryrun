@@ -78,7 +78,7 @@ fi
 # ---------------------------------------------------------------------------
 log "Installing evaluation helper packages…"
 retry 3 30 "$PIP" install --quiet \
-    "huggingface_hub[cli]>=0.24.0" \
+    "huggingface_hub>=0.24.0" \
     "datasets>=2.19.0" \
     "openai>=1.35.0" \
     "requests>=2.31.0" \

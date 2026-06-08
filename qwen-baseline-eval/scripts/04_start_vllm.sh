@@ -82,8 +82,16 @@ VLLM_CMD="vllm serve ${MODEL_ID} \
     ${EXTRA_PARALLEL_FLAGS} \
     ${VLLM_EXTRA_FLAGS:-}"
 
-# Pass HF_HOME so vLLM finds cached weights
-VLLM_ENV="HF_HOME=${HF_HOME} PATH=$(dirname "$PYTHON"):\$PATH"
+# Pass HF_HOME so vLLM finds cached weights.
+# Step 3 may have fallen back from /data/models to ~/models if /data wasn't
+# writable — it records the ACTUAL location in results/.hf_home.  Use that so
+# vLLM looks where the weights really are (otherwise it re-downloads).
+EFFECTIVE_HF_HOME="${HF_HOME}"
+if [[ -f "${SCRIPT_DIR}/../results/.hf_home" ]]; then
+    EFFECTIVE_HF_HOME="$(cat "${SCRIPT_DIR}/../results/.hf_home")"
+fi
+log "HF_HOME for vLLM: ${EFFECTIVE_HF_HOME}"
+VLLM_ENV="HF_HOME=${EFFECTIVE_HF_HOME} PATH=$(dirname "$PYTHON"):\$PATH"
 [[ -n "${HF_TOKEN:-}" ]] && VLLM_ENV="${VLLM_ENV} HF_TOKEN=${HF_TOKEN}"
 
 log "Starting vLLM in screen '${VLLM_SCREEN}'…"

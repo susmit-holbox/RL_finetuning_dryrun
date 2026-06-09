@@ -83,24 +83,26 @@ log "This will take a long time — each task spins up a Docker container"
 
 START_TS=$(date +%s)
 
-# Terminal-bench environment variables:
-#   LLM_BASE_URL  → vLLM endpoint (from inside container = docker gateway)
-#   LLM_API_KEY   → dummy value
-#   LLM_MODEL     → openai/<model-name> (OpenHands format)
-#
-# --cleanup removes task containers after each run (saves disk space)
-# --num-workers controls parallel task execution
+# Terminal-bench's OpenHands agent reads these HOST env vars and forwards them
+# into each task container (verified against the agent source):
+#   LLM_API_KEY   → required (non-empty), dummy value is fine for local vLLM
+#   LLM_MODEL     → openai/<model-name>  (also passed via --model)
+#   LLM_BASE_URL  → vLLM endpoint reachable FROM INSIDE the container (docker gw)
 export LLM_BASE_URL="${CONTAINER_LLM_BASE_URL}"
 export LLM_API_KEY="${OPENHANDS_LLM_API_KEY}"
 export LLM_MODEL="openai/${MODEL_NAME}"
 
+# Current `tb run` CLI (terminal-bench ≥ 0.2):
+#   --dataset name==version   (was: --dataset-name / --dataset-version)
+#   --n-concurrent N          (was: --num-workers)
+#   --output-path DIR         (was: --output-dir)
+#   --cleanup is the default; kept explicit
 "${TB_BIN:-tb}" run \
-    --dataset-name "${TERMINALBENCH_DATASET}" \
-    --dataset-version "${TERMINALBENCH_VERSION}" \
+    --dataset "${TERMINALBENCH_DATASET}==${TERMINALBENCH_VERSION}" \
     --agent openhands \
     --model "openai/${MODEL_NAME}" \
-    --num-workers "${TERMINALBENCH_WORKERS}" \
-    --output-dir "${OUT_DIR}" \
+    --n-concurrent "${TERMINALBENCH_WORKERS}" \
+    --output-path "${OUT_DIR}" \
     --cleanup \
     2>&1 | tee "$LOG_FILE"
 
@@ -113,20 +115,28 @@ ELAPSED=$(( END_TS - START_TS ))
 # ---------------------------------------------------------------------------
 log "TerminalBench finished in $(( ELAPSED / 60 ))m $(( ELAPSED % 60 ))s"
 
-# tb typically writes results.json in the output dir
-if [[ -f "${OUT_DIR}/results.json" ]]; then
-    $PYTHON - <<PYPARSE
-import json
+# tb writes results.json under ${OUT_DIR}/<run-id>/ — find it wherever it lands.
+RESULTS_JSON=$(find "${OUT_DIR}" -name "results.json" -type f 2>/dev/null | head -1 || true)
+if [[ -n "$RESULTS_JSON" ]]; then
+    log "Results file: ${RESULTS_JSON}"
+    "$PYTHON" - "$RESULTS_JSON" <<'PYPARSE'
+import json, sys
 from pathlib import Path
-p = Path("${OUT_DIR}/results.json")
-data = json.loads(p.read_text())
-total = data.get("total", "?")
-passed = data.get("passed", "?")
-rate = data.get("pass_rate", "?")
+data = json.loads(Path(sys.argv[1]).read_text())
+# tb schema varies by version; probe common keys
+def g(*keys):
+    for k in keys:
+        if k in data: return data[k]
+    return "?"
+total  = g("n_tasks", "total", "n_trials")
+passed = g("n_resolved", "passed", "n_passed")
+rate   = g("accuracy", "pass_rate", "resolved_rate")
 print(f"  Total tasks : {total}")
 print(f"  Passed      : {passed}")
 print(f"  Pass rate   : {rate}")
 PYPARSE
+else
+    warn "No results.json found under ${OUT_DIR} — check ${LOG_FILE}"
 fi
 
 # Write summary

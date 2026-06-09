@@ -36,6 +36,23 @@ if screen_running "$VLLM_SCREEN"; then
 fi
 
 # ---------------------------------------------------------------------------
+# Defensive cleanup: a previous failed/timed-out run may have left a vLLM
+# process holding GPU memory (orphaned or under a dead screen).  Clear it so
+# the new server has the full VRAM budget.
+# ---------------------------------------------------------------------------
+if pgrep -f "vllm serve" &>/dev/null; then
+    warn "Found stale 'vllm serve' process(es) — terminating to free GPU memory"
+    pkill -TERM -f "vllm serve" 2>/dev/null || true
+    sleep 5
+    pkill -KILL -f "vllm serve" 2>/dev/null || true
+    sleep 3
+fi
+if command -v nvidia-smi &>/dev/null; then
+    USED_MIB=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
+    [[ -n "$USED_MIB" ]] && log "GPU memory in use before launch: ${USED_MIB} MiB"
+fi
+
+# ---------------------------------------------------------------------------
 # Select tool-call parser
 # ---------------------------------------------------------------------------
 select_tool_call_parser() {
@@ -67,6 +84,20 @@ if [[ "$MODEL_FAMILY" == "qwen3_coder" ]] && (( NGPUS > 1 )); then
     EXTRA_PARALLEL_FLAGS="--enable-expert-parallel"
 fi
 
+# Quantization (to fit large models on smaller GPUs, e.g. 14B on a 23GB L4).
+#   VLLM_QUANTIZATION=fp8   → near-lossless, ~half the weight memory, online quant
+#   (leave blank for pre-quantized checkpoints like *-AWQ / *-GPTQ — vLLM
+#    auto-detects those from the model config.)
+QUANT_FLAG=""
+if [[ -n "${VLLM_QUANTIZATION:-}" ]]; then
+    QUANT_FLAG="--quantization ${VLLM_QUANTIZATION}"
+    log "Quantization: ${VLLM_QUANTIZATION}"
+fi
+
+# GPU memory utilization (higher packs more KV cache; tight on small VRAM)
+GMU_FLAG=""
+[[ -n "${VLLM_GPU_MEM_UTIL:-}" ]] && GMU_FLAG="--gpu-memory-utilization ${VLLM_GPU_MEM_UTIL}"
+
 # ---------------------------------------------------------------------------
 # Build the vllm serve command
 # ---------------------------------------------------------------------------
@@ -79,6 +110,8 @@ VLLM_CMD="vllm serve ${MODEL_ID} \
     --tool-call-parser ${TOOL_CALL_PARSER} \
     --served-model-name ${MODEL_NAME} \
     --trust-remote-code \
+    ${QUANT_FLAG} \
+    ${GMU_FLAG} \
     ${EXTRA_PARALLEL_FLAGS} \
     ${VLLM_EXTRA_FLAGS:-}"
 
@@ -97,20 +130,65 @@ VLLM_ENV="HF_HOME=${EFFECTIVE_HF_HOME} PATH=$(dirname "$PYTHON"):\$PATH"
 log "Starting vLLM in screen '${VLLM_SCREEN}'…"
 log "Command: $VLLM_CMD"
 
-# Write a launcher script so we can inspect it and the screen session can source it
+# vLLM log file — CRITICAL for diagnosing load failures (OOM, etc.)
+VLLM_LOG="${RESULTS_DIR}/${RUN_TAG}/vllm_server.log"
+mkdir -p "$(dirname "$VLLM_LOG")"
+: > "$VLLM_LOG"
+log "vLLM log: ${VLLM_LOG}"
+
+# Write a launcher script that tees ALL output to the log file
 cat > /tmp/vllm_launcher.sh <<LAUNCHER
 #!/usr/bin/env bash
 export ${VLLM_ENV}
+exec > >(tee -a "${VLLM_LOG}") 2>&1
+echo "=== vLLM launcher started \$(date) ==="
 set -x
 ${VLLM_CMD}
+echo "=== vLLM process EXITED with code \$? at \$(date) ==="
 LAUNCHER
 chmod +x /tmp/vllm_launcher.sh
 
 # Launch in a detached screen
 screen -dmS "$VLLM_SCREEN" bash /tmp/vllm_launcher.sh
 
-log "Waiting for vLLM to load model (large models may take 5-15 min)…"
-wait_for_vllm "localhost" "${VLLM_PORT}" 900   # 15 min timeout
+# ---------------------------------------------------------------------------
+# Wait for health, but fail fast if the process dies or OOMs
+# ---------------------------------------------------------------------------
+log "Waiting for vLLM to load model (14B may take 3-10 min)…"
+TIMEOUT=900
+start=$(date +%s)
+while true; do
+    if curl -sf "http://localhost:${VLLM_PORT}/health" &>/dev/null; then
+        ok "vLLM is healthy"
+        break
+    fi
+    # Screen died → vLLM crashed; surface the error immediately
+    if ! screen_running "$VLLM_SCREEN"; then
+        warn "vLLM process exited before becoming healthy. Last 40 log lines:"
+        echo "----------------------------------------------------------------"
+        tail -40 "$VLLM_LOG" 2>/dev/null
+        echo "----------------------------------------------------------------"
+        if grep -qiE "out of memory|outofmemory|CUDA out of memory|No available memory|KV cache" "$VLLM_LOG"; then
+            die "vLLM ran OUT OF GPU MEMORY. The model does not fit in this GPU's VRAM.
+  Fixes (set in config.env):
+    • VLLM_QUANTIZATION=fp8          (≈half the weight memory, near-lossless)
+    • use a pre-quantized model (…-AWQ) via MODEL_ID
+    • lower MAX_MODEL_LEN (e.g. 16384 or 8192)
+  Full log: ${VLLM_LOG}"
+        fi
+        die "vLLM failed to start — see ${VLLM_LOG}"
+    fi
+    elapsed=$(( $(date +%s) - start ))
+    if (( elapsed >= TIMEOUT )); then
+        warn "vLLM not healthy within ${TIMEOUT}s. Last 40 log lines:"
+        echo "----------------------------------------------------------------"
+        tail -40 "$VLLM_LOG" 2>/dev/null
+        echo "----------------------------------------------------------------"
+        kill_screen "$VLLM_SCREEN"
+        die "vLLM did not become healthy within ${TIMEOUT}s — see ${VLLM_LOG}"
+    fi
+    sleep 5
+done
 
 # ---------------------------------------------------------------------------
 # Verify model is listed

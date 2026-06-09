@@ -97,9 +97,18 @@ export LLM_MODEL="openai/${MODEL_NAME}"
 #   --n-concurrent N          (was: --num-workers)
 #   --output-path DIR         (was: --output-dir)
 #   --cleanup is the default; kept explicit
+#
+# -k version=<X>: PIN the OpenHands version installed INSIDE each container.
+#   The tb OpenHands agent runs `python -m openhands.core.main`, which exists
+#   ONLY in the 0.x series.  Without this pin, tb installs latest (1.x), which
+#   removed that module → all tasks fail with 0 tokens.  This flows through
+#   BaseAgent(version=…) into the in-container `pip install openhands-ai==X`.
+TB_OH_VERSION="${TB_OPENHANDS_VERSION:-0.62.0}"
+log "Pinning in-container OpenHands to version ${TB_OH_VERSION} (has openhands.core.main)"
 "${TB_BIN:-tb}" run \
     --dataset "${TERMINALBENCH_DATASET}==${TERMINALBENCH_VERSION}" \
     --agent openhands \
+    --agent-kwarg "version=${TB_OH_VERSION}" \
     --model "openai/${MODEL_NAME}" \
     --n-concurrent "${TERMINALBENCH_WORKERS}" \
     --output-path "${OUT_DIR}" \

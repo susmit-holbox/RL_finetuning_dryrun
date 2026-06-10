@@ -80,6 +80,10 @@ HOST_LLM_BASE_URL="http://localhost:${VLLM_PORT}/v1"
 # ---------------------------------------------------------------------------
 export MSWEA_COST_TRACKING="ignore_errors"
 
+# Advertise the model's real context window to litellm (keeps token accounting
+# correct and registers a 0-cost entry). See lib.sh:ensure_litellm_hook.
+HOOK_DIR=$(ensure_litellm_hook)
+
 log "Starting SWE-bench (dataset=${SWEBENCH_DATASET}, split=${SWEBENCH_SPLIT}, limit=${SWEBENCH_LIMIT})…"
 log "Model: openai/${MODEL_NAME} @ ${HOST_LLM_BASE_URL}"
 log "Workers: ${SWEBENCH_WORKERS} | step_limit: ${SWE_STEP_LIMIT} | Results: ${OUT_DIR}"
@@ -89,6 +93,9 @@ START_TS=$(date +%s)
 # --subset accepts a dataset path directly; --slice "0:N" limits instances.
 # First -c MUST be the config file (it disables the default config); the
 # remaining -c key=value pairs are recursively merged on top.
+PYTHONPATH="${HOOK_DIR}:${PYTHONPATH:-}" \
+MODEL_REG_NAME="${MODEL_NAME}" \
+MODEL_CONTEXT_WINDOW="${MAX_MODEL_LEN}" \
 "$MINI_BIN" swebench \
     --subset "${SWEBENCH_DATASET}" \
     --split "${SWEBENCH_SPLIT}" \

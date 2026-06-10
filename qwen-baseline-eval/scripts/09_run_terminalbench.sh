@@ -66,6 +66,12 @@ AGENT_KWARGS=(
     --agent-kwarg "api_key=${LLM_API_KEY:-dummy}"
     --agent-kwarg "temperature=0.0"
 )
+
+# Tell litellm the model's REAL context window so Terminus-2 trims correctly
+# (otherwise it assumes a 1,000,000-token window and loops on
+# context_length_exceeded). See lib.sh:ensure_litellm_hook.
+HOOK_DIR=$(ensure_litellm_hook)
+log "Context window advertised to agent: ${MAX_MODEL_LEN} tokens (via litellm hook)"
 # parser_name is a terminus-2-only kwarg (terminus-1 has no such argument).
 if [[ "${TB_AGENT}" == "terminus-2" && -n "${TB_PARSER:-}" ]]; then
     AGENT_KWARGS+=( --agent-kwarg "parser_name=${TB_PARSER}" )
@@ -85,6 +91,9 @@ START_TS=$(date +%s)
 #   --dataset name==version   --agent terminus|terminus-2   --model openai/<name>
 #   --agent-kwarg key=value   --n-concurrent N   --output-path DIR
 # --cleanup (default) removes per-run images afterwards.
+PYTHONPATH="${HOOK_DIR}:${PYTHONPATH:-}" \
+MODEL_REG_NAME="${MODEL_NAME}" \
+MODEL_CONTEXT_WINDOW="${MAX_MODEL_LEN}" \
 "$TB_BIN" run \
     --dataset "${TERMINALBENCH_DATASET}==${TERMINALBENCH_VERSION}" \
     --agent "${TB_AGENT}" \

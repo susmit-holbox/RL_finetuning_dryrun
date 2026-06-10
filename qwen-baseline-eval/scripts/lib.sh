@@ -36,6 +36,7 @@ load_config() {
     : "${TB_VERSION:=0.2.18}"
     : "${TB_AGENT:=terminus-2}"
     : "${TB_PARSER:=xml}"
+    : "${MAX_MODEL_LEN:=16384}"
 
     # Set RUN_TAG if not already set
     if [[ -z "${RUN_TAG:-}" ]]; then
@@ -136,6 +137,56 @@ wait_for_vllm() {
         sleep 5
     done
     ok "vLLM is healthy"
+}
+
+# ---------------------------------------------------------------------------
+# litellm context-window hook.
+#
+# Both agents call litellm. For a locally-served vLLM model, litellm has NO
+# model_info, so litellm.get_max_tokens(<name>) returns None. Terminus-2 then
+# falls back to assuming a 1,000,000-token context window
+# (terminus_2.py:_get_model_context_limit) and NEVER trims the conversation, so
+# once a task's history exceeds the REAL window every call dies with
+# `context_length_exceeded` in an unrecoverable loop.
+#
+# Fix: drop a sitecustomize.py on PYTHONPATH that runs at python startup and
+# registers the served model's real context window with litellm. The agent then
+# trims to fit. Activated by exporting MODEL_REG_NAME + MODEL_CONTEXT_WINDOW and
+# prepending the returned dir to PYTHONPATH for the agent invocation.
+#
+# Usage:
+#   HOOK_DIR=$(ensure_litellm_hook)
+#   PYTHONPATH="${HOOK_DIR}:${PYTHONPATH:-}" MODEL_REG_NAME="$MODEL_NAME" \
+#     MODEL_CONTEXT_WINDOW="$MAX_MODEL_LEN" <agent-command>
+# ---------------------------------------------------------------------------
+ensure_litellm_hook() {
+    local dir="${SCRIPT_DIR}/../results/litellm_hook"
+    mkdir -p "$dir"
+    cat > "${dir}/sitecustomize.py" <<'PYHOOK'
+# Auto-injected via PYTHONPATH. Tells litellm the locally-served model's real
+# context window so agents (esp. Terminus-2) trim the conversation correctly
+# instead of assuming a 1,000,000-token window. See lib.sh:ensure_litellm_hook.
+import os
+try:
+    _name = os.environ.get("MODEL_REG_NAME")
+    _ctx = int(os.environ.get("MODEL_CONTEXT_WINDOW") or 0)
+    if _name and _ctx > 0:
+        import litellm
+        _entry = {
+            "max_tokens": _ctx,
+            "max_input_tokens": _ctx,
+            "max_output_tokens": _ctx,
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 0.0,
+            "output_cost_per_token": 0.0,
+        }
+        # Register both the bare served name and the openai/ litellm form.
+        litellm.register_model({_name: _entry, f"openai/{_name}": _entry})
+except Exception:
+    pass
+PYHOOK
+    echo "$dir"
 }
 
 # ---------------------------------------------------------------------------

@@ -1,70 +1,48 @@
 #!/usr/bin/env bash
-# 09_run_terminalbench.sh — Run TerminalBench evaluation using OpenHands.
+# 09_run_terminalbench.sh — Run TerminalBench evaluation using the Terminus agent.
 #
-# TerminalBench integration (verified research findings):
-#   • tb run --agent openhands --model <model>
-#   • OpenHands runs INSIDE each task container with RUNTIME=local
-#   • LLM_BASE_URL must resolve from INSIDE the container
-#     → Use Docker bridge gateway IP (e.g. 172.17.0.1), NOT localhost
-#   • LLM_API_KEY and LLM_MODEL passed as env vars
+# Why Terminus (vs the old in-container OpenHands tb-agent):
+#   • Terminus is terminal-bench's own reference agent. It runs IN THE HOST
+#     `tb` process and drives each task container purely over tmux
+#     (send_keys / capture_pane). The LLM HTTP calls are therefore made FROM
+#     THE HOST, so vLLM is reached at http://localhost:${VLLM_PORT}/v1 directly
+#     — NO Docker bridge gateway IP and NO iptables workaround (unlike the old
+#     OpenHands agent, which pip-installed itself INSIDE every container).
+#   • Terminus parses a JSON (terminus-1) or JSON/XML (terminus-2) command batch
+#     from plain text — it does NOT use the OpenAI tool_calls API, so the
+#     Qwen2.5-Coder `hermes` tool-call silent-failure does not affect it.
+#
+# Both the agent name (terminus / terminus-2) and the terminus-2 parser
+# (xml / json) are configurable via TB_AGENT / TB_PARSER in config.env.
 #
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib.sh"
 load_config
 
-log "=== Step 9: TerminalBench evaluation ==="
+log "=== Step 9: TerminalBench evaluation (agent: ${TB_AGENT}) ==="
 
-# terminal-bench lives in the EVAL venv (set up in step 6).
-EVAL_PY=$(eval_python)
-EVAL_BIN=$(dirname "$EVAL_PY")
-PYTHON="$EVAL_PY"
-
-# Resolve tb: prefer the marker written by step 6, then eval venv, then PATH
+# ---------------------------------------------------------------------------
+# Resolve tb (terminal-bench venv) — marker from step 6, then venv, then PATH.
+# ---------------------------------------------------------------------------
 TB_BIN=""
 if [[ -f "${SCRIPT_DIR}/../results/.tb_bin" ]]; then TB_BIN=$(cat "${SCRIPT_DIR}/../results/.tb_bin"); fi
-if [[ ! -x "$TB_BIN" ]] && [[ -x "${EVAL_BIN}/tb" ]]; then TB_BIN="${EVAL_BIN}/tb"; fi
+if [[ ! -x "$TB_BIN" ]] && [[ -x "${TB_VENV_DIR:-}/bin/tb" ]]; then TB_BIN="${TB_VENV_DIR}/bin/tb"; fi
 if [[ ! -x "$TB_BIN" ]]; then TB_BIN=$(command -v tb 2>/dev/null || echo ""); fi
+[[ -x "$TB_BIN" ]] || die "'tb' not found — run 06_setup_agents.sh first."
+
+# Python for parsing results.json (the tb venv python).
+TB_PY=""
+if [[ -f "${SCRIPT_DIR}/../results/.tb_python" ]]; then TB_PY=$(cat "${SCRIPT_DIR}/../results/.tb_python"); fi
+[[ -x "$TB_PY" ]] || TB_PY=$(eval_python)
 
 # ---------------------------------------------------------------------------
-# Pre-flight checks
+# Pre-flight: vLLM must be healthy ON THE HOST (Terminus calls it from here).
 # ---------------------------------------------------------------------------
-if [[ ! -x "$TB_BIN" ]]; then
-    warn "'tb' not found — installing terminal-bench into eval venv…"
-    "${EVAL_BIN}/pip" install --quiet \
-        "git+https://github.com/harbor-framework/terminal-bench.git" || \
-        die "terminal-bench installation failed"
-    TB_BIN="${EVAL_BIN}/tb"
-    [[ -x "$TB_BIN" ]] || die "terminal-bench installed but 'tb' binary missing at ${TB_BIN}"
-fi
-
 if ! curl -sf "http://localhost:${VLLM_PORT}/health" &>/dev/null; then
     die "vLLM not healthy at localhost:${VLLM_PORT}. Run 04_start_vllm.sh first."
 fi
-
-# ---------------------------------------------------------------------------
-# Resolve the LLM base URL for inside-container access
-#
-# TerminalBench runs OpenHands INSIDE each task Docker container.
-# From inside a container, 'localhost' is the container itself, not the host.
-# We need the Docker bridge gateway IP to reach the vLLM server on the host.
-#
-# Method: use 'docker network inspect bridge' to get the gateway IP.
-# ---------------------------------------------------------------------------
-DOCKER_GW=$(docker_host_ip)
-CONTAINER_LLM_BASE_URL="http://${DOCKER_GW}:${VLLM_PORT}/v1"
-log "Docker gateway IP: ${DOCKER_GW}"
-log "Container→vLLM URL: ${CONTAINER_LLM_BASE_URL}"
-
-# Sanity check: can we reach vLLM via the gateway IP?
-if ! curl -sf "http://${DOCKER_GW}:${VLLM_PORT}/health" &>/dev/null; then
-    warn "Cannot reach vLLM via gateway IP ${DOCKER_GW}:${VLLM_PORT}"
-    warn "Trying to add iptables rule to allow container→host traffic…"
-    sudo iptables -I DOCKER-USER -j ACCEPT 2>/dev/null || true
-    if ! curl -sf "http://${DOCKER_GW}:${VLLM_PORT}/health" &>/dev/null; then
-        warn "Still unreachable. Containers may not be able to reach vLLM."
-        warn "Proceeding anyway — some tasks may fail with connection errors."
-    fi
-fi
+HOST_LLM_BASE_URL="http://localhost:${VLLM_PORT}/v1"
+log "Terminus → vLLM URL (host): ${HOST_LLM_BASE_URL}"
 
 # ---------------------------------------------------------------------------
 # Output directory
@@ -74,43 +52,44 @@ mkdir -p "$OUT_DIR"
 LOG_FILE="${OUT_DIR}/tb_run.log"
 
 # ---------------------------------------------------------------------------
+# LLM wiring for litellm (Terminus uses litellm under the hood).
+#   --model openai/<served-name>     → generic OpenAI-compatible routing
+#   --agent-kwarg api_base/api_key   → forwarded into the Terminus LiteLLM client
+#   OPENAI_* env                     → belt-and-suspenders for litellm's client
+# ---------------------------------------------------------------------------
+export OPENAI_API_KEY="${LLM_API_KEY:-dummy}"
+export OPENAI_API_BASE="${HOST_LLM_BASE_URL}"
+export OPENAI_BASE_URL="${HOST_LLM_BASE_URL}"
+
+AGENT_KWARGS=(
+    --agent-kwarg "api_base=${HOST_LLM_BASE_URL}"
+    --agent-kwarg "api_key=${LLM_API_KEY:-dummy}"
+    --agent-kwarg "temperature=0.0"
+)
+# parser_name is a terminus-2-only kwarg (terminus-1 has no such argument).
+if [[ "${TB_AGENT}" == "terminus-2" && -n "${TB_PARSER:-}" ]]; then
+    AGENT_KWARGS+=( --agent-kwarg "parser_name=${TB_PARSER}" )
+fi
+
+# ---------------------------------------------------------------------------
 # Run TerminalBench
 # ---------------------------------------------------------------------------
-log "Starting TerminalBench (dataset=${TERMINALBENCH_DATASET} v${TERMINALBENCH_VERSION})…"
-log "Results: ${OUT_DIR}"
-log "Log: ${LOG_FILE}"
-log "This will take a long time — each task spins up a Docker container"
+log "Starting TerminalBench (dataset=${TERMINALBENCH_DATASET}==${TERMINALBENCH_VERSION})…"
+log "Agent: ${TB_AGENT}${TB_PARSER:+ (parser=${TB_PARSER})} | Model: openai/${MODEL_NAME}"
+log "Concurrency: ${TERMINALBENCH_WORKERS} | Results: ${OUT_DIR}"
+log "This will take a long time — each task spins up a Docker container."
 
 START_TS=$(date +%s)
 
-# Terminal-bench's OpenHands agent reads these HOST env vars and forwards them
-# into each task container (verified against the agent source):
-#   LLM_API_KEY   → required (non-empty), dummy value is fine for local vLLM
-#   LLM_MODEL     → openai/<model-name>  (also passed via --model)
-#   LLM_BASE_URL  → vLLM endpoint reachable FROM INSIDE the container (docker gw)
-export LLM_BASE_URL="${CONTAINER_LLM_BASE_URL}"
-export LLM_API_KEY="${OPENHANDS_LLM_API_KEY}"
-export LLM_MODEL="openai/${MODEL_NAME}"
-
-# Current `tb run` CLI (terminal-bench ≥ 0.2):
-#   --dataset name==version   (was: --dataset-name / --dataset-version)
-#   --n-concurrent N          (was: --num-workers)
-#   --output-path DIR         (was: --output-dir)
-#   --cleanup is the default; kept explicit
-#
-# -k version=<X>: PIN the OpenHands version installed INSIDE each container.
-#   The tb OpenHands agent runs `python -m openhands.core.main`, which exists
-#   ONLY in the 0.x series, AND the pinned version must INSTALL cleanly from
-#   PyPI (0.60–0.62 are broken: they pin an unpublishable openhands-agent-server
-#   alpha).  0.59.0 satisfies both.  Flows via BaseAgent(version=…) into the
-#   in-container `pip install openhands-ai==X`.
-TB_OH_VERSION="${TB_OPENHANDS_VERSION:-0.59.0}"
-log "Pinning in-container OpenHands to version ${TB_OH_VERSION} (0.x: has openhands.core.main, clean PyPI install)"
-"${TB_BIN:-tb}" run \
+# Current `tb run` CLI (terminal-bench 0.2.x):
+#   --dataset name==version   --agent terminus|terminus-2   --model openai/<name>
+#   --agent-kwarg key=value   --n-concurrent N   --output-path DIR
+# --cleanup (default) removes per-run images afterwards.
+"$TB_BIN" run \
     --dataset "${TERMINALBENCH_DATASET}==${TERMINALBENCH_VERSION}" \
-    --agent openhands \
-    --agent-kwarg "version=${TB_OH_VERSION}" \
+    --agent "${TB_AGENT}" \
     --model "openai/${MODEL_NAME}" \
+    "${AGENT_KWARGS[@]}" \
     --n-concurrent "${TERMINALBENCH_WORKERS}" \
     --output-path "${OUT_DIR}" \
     --cleanup \
@@ -125,40 +104,49 @@ ELAPSED=$(( END_TS - START_TS ))
 # ---------------------------------------------------------------------------
 log "TerminalBench finished in $(( ELAPSED / 60 ))m $(( ELAPSED % 60 ))s"
 
-# tb writes results.json under ${OUT_DIR}/<run-id>/ — find it wherever it lands.
-RESULTS_JSON=$(find "${OUT_DIR}" -name "results.json" -type f 2>/dev/null | head -1 || true)
+# tb writes results.json under ${OUT_DIR}/<run-id>/ — find the newest one.
+RESULTS_JSON=$(find "${OUT_DIR}" -name "results.json" -type f 2>/dev/null \
+                  | xargs -r ls -t 2>/dev/null | head -1 || true)
+N_RESOLVED="?"; N_TOTAL="?"; ACCURACY="?"
 if [[ -n "$RESULTS_JSON" ]]; then
     log "Results file: ${RESULTS_JSON}"
-    "$PYTHON" - "$RESULTS_JSON" <<'PYPARSE'
+    # terminal-bench BenchmarkResults schema: n_resolved, n_unresolved, accuracy
+    read -r N_RESOLVED N_TOTAL ACCURACY < <("$TB_PY" - "$RESULTS_JSON" <<'PYPARSE'
 import json, sys
 from pathlib import Path
-data = json.loads(Path(sys.argv[1]).read_text())
-# tb schema varies by version; probe common keys
-def g(*keys):
-    for k in keys:
-        if k in data: return data[k]
-    return "?"
-total  = g("n_tasks", "total", "n_trials")
-passed = g("n_resolved", "passed", "n_passed")
-rate   = g("accuracy", "pass_rate", "resolved_rate")
-print(f"  Total tasks : {total}")
-print(f"  Passed      : {passed}")
-print(f"  Pass rate   : {rate}")
+d = json.loads(Path(sys.argv[1]).read_text())
+res = d.get("n_resolved")
+unres = d.get("n_unresolved")
+total = (res or 0) + (unres or 0) if res is not None else len(d.get("results", []))
+acc = d.get("accuracy")
+print(res if res is not None else "?",
+      total if total else "?",
+      f"{acc:.4f}" if isinstance(acc, (int, float)) else "?")
 PYPARSE
+) || true
+    log "  Resolved : ${N_RESOLVED} / ${N_TOTAL}"
+    log "  Accuracy : ${ACCURACY}"
 else
     warn "No results.json found under ${OUT_DIR} — check ${LOG_FILE}"
 fi
 
-# Write summary
+# Write summary (self-describing for cross-run comparability)
 cat > "${OUT_DIR}/run_summary.json" <<SUMMARY
 {
+  "benchmark": "terminalbench",
+  "agent": "${TB_AGENT}",
+  "agent_parser": "${TB_PARSER:-}",
+  "harness": "terminal-bench ${TB_VERSION:-latest}",
   "model": "${MODEL_ID}",
   "model_name": "${MODEL_NAME}",
   "dataset": "${TERMINALBENCH_DATASET}",
   "version": "${TERMINALBENCH_VERSION}",
-  "vllm_url_host": "http://localhost:${VLLM_PORT}/v1",
-  "vllm_url_container": "${CONTAINER_LLM_BASE_URL}",
+  "n_concurrent": ${TERMINALBENCH_WORKERS},
+  "vllm_url": "${HOST_LLM_BASE_URL}",
   "run_tag": "${RUN_TAG}",
+  "resolved": "${N_RESOLVED}",
+  "total": "${N_TOTAL}",
+  "accuracy": "${ACCURACY}",
   "elapsed_seconds": ${ELAPSED},
   "exit_code": ${TB_EXIT}
 }

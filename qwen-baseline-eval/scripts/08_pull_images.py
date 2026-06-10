@@ -7,14 +7,20 @@ Confirmed naming conventions (verified by actual docker pull):
   ghcr.io name        : ghcr.io/epoch-research/swe-bench.eval.x86_64.astropy__astropy-14365
   Docker Hub name     : swebench/sweb.eval.x86_64.astropy_1776_astropy-14365
                         (double __ → _1776_ conversion required!)
-  OpenHands expects   : swebench/sweb.eval.x86_64.astropy__astropy-14365
-                        (same as instance_id format, no _1776_)
+  mini-swe-agent runs : swebench/sweb.eval.x86_64.astropy_1776_astropy-14365:latest
+                        (lowercased; __ → _1776_ — SAME as Docker Hub's name)
+  swebench harness    : swebench/sweb.eval.x86_64.astropy__astropy-14365:latest
+                        (the scoring harness uses the raw instance_id / __ form)
+
+Because the two consumers disagree on the local tag, every pulled image is
+tagged BOTH ways locally so neither re-pulls from Docker Hub:
+  • <__ form>     — for the swebench scoring harness (run_evaluation)
+  • <_1776_ form> — for mini-swe-agent's per-instance Docker environment
 
 Pull priority (highest to lowest):
   1. ECR_REGISTRY env var — private ECR already populated (no rate limits)
   2. ghcr.io/epoch-research — public, no Docker Hub rate limit, uses __ format
   3. Docker Hub swebench/ — authenticated 200/6h, requires __ → _1776_ conversion
-     then re-tag to __ format for OpenHands
 
 Rate limits:
   - Docker Hub anonymous : 100 pulls / 6 h
@@ -80,8 +86,20 @@ def instance_to_ecr_name(instance_id: str) -> str:
 
 
 def canonical_name(instance_id: str) -> str:
-    """The name OpenHands looks for when running SWE-bench tasks."""
+    """The __ form, used by the swebench scoring harness (run_evaluation)."""
     return f"swebench/sweb.eval.x86_64.{instance_id}:latest"
+
+
+def minisweagent_name(instance_id: str) -> str:
+    """The exact local tag mini-swe-agent's docker environment runs.
+
+    Mirrors minisweagent.run.benchmarks.swebench.get_swebench_docker_image_name:
+        f"docker.io/swebench/sweb.eval.x86_64.{__→_1776_}:latest".lower()
+    `docker.io/swebench/x` and `swebench/x` resolve to the SAME local image, so
+    tagging the short form is sufficient for `docker run` to hit it locally.
+    """
+    dh_id = instance_id.replace("__", "_1776_")
+    return f"swebench/sweb.eval.x86_64.{dh_id}:latest".lower()
 
 
 # ---------------------------------------------------------------------------
@@ -153,10 +171,14 @@ def ecr_login() -> bool:
 # Pull one SWE-bench image — try all sources in priority order
 # ---------------------------------------------------------------------------
 def pull_swebench_image(instance_id: str) -> dict:
-    target = canonical_name(instance_id)  # what OpenHands expects
+    target = canonical_name(instance_id)  # __ form for the scoring harness
 
-    # Already present in the right form?
+    # Already present in BOTH forms the consumers need?
+    if docker_image_exists(target) and docker_image_exists(minisweagent_name(instance_id)):
+        return {"instance_id": instance_id, "status": "skipped", "source": "local"}
+    # Image is here but only one tag — re-tag locally (no network) and finish.
     if docker_image_exists(target):
+        _tag_for_consumers(target, instance_id)
         return {"instance_id": instance_id, "status": "skipped", "source": "local"}
 
     # --- Source 1: ECR (no rate limit, user's private cache) ---
@@ -182,7 +204,7 @@ def pull_swebench_image(instance_id: str) -> dict:
     for attempt in range(1, 9):
         ok_flag, out = docker_pull(dh_img, timeout=300)
         if ok_flag:
-            # Re-tag to the canonical __ format that OpenHands expects
+            # Re-tag to the canonical __ format the scoring harness expects
             subprocess.run(["docker", "tag", dh_img, target], capture_output=True)
             _push_to_local_registry(target, instance_id)
             return {"instance_id": instance_id, "status": "pulled",
@@ -199,10 +221,21 @@ def pull_swebench_image(instance_id: str) -> dict:
             "tried": [gh_img, dh_img]}
 
 
-def _push_to_local_registry(canonical_img: str, instance_id: str) -> None:
+def _tag_for_consumers(canonical_img: str, instance_id: str) -> None:
+    """Add the local tags both consumers expect, then mirror to the pull-through
+    cache. `canonical_img` is the __ form (already present locally)."""
+    # mini-swe-agent's per-instance docker env looks up the _1776_ form.
+    mini_tag = minisweagent_name(instance_id)
+    if mini_tag != canonical_img:
+        subprocess.run(["docker", "tag", canonical_img, mini_tag], capture_output=True)
+    # Persist in the local pull-through registry (survives across runs).
     local_tag = f"localhost:{LOCAL_PORT}/swebench/sweb.eval.x86_64.{instance_id}:latest"
     subprocess.run(["docker", "tag", canonical_img, local_tag], capture_output=True)
     subprocess.run(["docker", "push", local_tag], capture_output=True)
+
+
+# Back-compat alias (older call sites / external scripts may reference this).
+_push_to_local_registry = _tag_for_consumers
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +334,7 @@ def main() -> int:
     ok(f"Done — pulled: {len(pulled)}, skipped: {len(skipped)}, failed: {len(failed)}")
     if failed:
         warn(f"Failed ({len(failed)}): {failed[:5]}{'…' if len(failed) > 5 else ''}")
-        warn("Failed images will be pulled on-demand by OpenHands (with retry).")
+        warn("Failed images will be pulled on-demand by the agent (with retry).")
 
     return 0 if not failed else 1
 

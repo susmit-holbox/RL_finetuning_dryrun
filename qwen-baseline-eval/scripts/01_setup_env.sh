@@ -16,7 +16,7 @@ load_config
 
 # Safety net: config.env may predate these vars
 EVAL_VENV_DIR="${EVAL_VENV_DIR:-${HOME}/eval_venv}"
-PY_VERSION="${PY_VERSION:-3.12}"   # target Python for eval + OpenHands venvs
+PY_VERSION="${PY_VERSION:-3.12}"   # target Python for eval + agent venvs
 
 log "=== Step 1: Environment setup ==="
 

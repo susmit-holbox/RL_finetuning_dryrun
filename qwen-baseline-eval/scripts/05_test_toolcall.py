@@ -35,7 +35,7 @@ BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 API_KEY  = os.environ.get("VLLM_API_KEY", "not-needed")
 MODEL    = os.environ.get("MODEL_NAME", "Qwen2.5-Coder-32B-Instruct")
 
-# For OpenHands, the model name is prefixed with "openai/"
+# litellm routes OpenAI-compatible endpoints via the "openai/" prefix
 OH_MODEL = f"openai/{MODEL}"
 
 # ---------------------------------------------------------------------------

@@ -15,12 +15,12 @@
 #   2.  Install vLLM (GPU)
 #   3.  Download model from HuggingFace
 #   4.  Start vLLM server (in a sub-screen session)
-#   5.  Test tool-call endpoint
-#   6.  Install OpenHands + TerminalBench
+#   5.  Test tool-call endpoint (informational — the agents don't use tool_calls)
+#   6.  Install eval agents (mini-swe-agent + Terminus)
 #   7.  Set up local Docker pull-through cache (rate-limit mitigation)
 #   8.  Pre-pull SWE-bench Docker images (ghcr.io primary, Docker Hub fallback)
-#   9.  Run TerminalBench evaluation
-#   10. Run SWE-bench evaluation
+#   9.  Run TerminalBench evaluation (Terminus)
+#   10. Run SWE-bench evaluation (mini-swe-agent)
 #   11. Collect and archive all results
 #
 # Edit config.env before running.
@@ -72,8 +72,10 @@ run_step  2  "02_install_vllm.sh"   "Install vLLM"
 run_step  3  "03_download_model.sh" "Download model from HuggingFace"
 run_step  4  "04_start_vllm.sh"     "Start vLLM server"
 
-# Tool-call test (non-fatal: Qwen2.5-Coder may fail silently — we log and continue)
-banner "Step 5: Tool-call endpoint test"
+# Tool-call test (informational only). Both executor agents parse commands from
+# TEXT (mini-swe-agent: fenced bash; Terminus: JSON/XML), so a failing tool-call
+# parser does NOT affect the evals. We still log it for diagnostics.
+banner "Step 5: Tool-call endpoint test (informational)"
 # Resolve eval venv python (written by step 1)
 _EVAL_PY=$(cat "${REPO_DIR}/results/.eval_python" 2>/dev/null || command -v python3)
 VLLM_BASE_URL="http://localhost:${VLLM_PORT}/v1" \
@@ -89,7 +91,7 @@ RUN_TAG="${RUN_TAG}" \
     fi
 }
 
-run_step  6  "06_setup_openhands.sh" "Install OpenHands + TerminalBench"
+run_step  6  "06_setup_agents.sh"    "Install eval agents (mini-swe-agent + Terminus)"
 run_step  7  "07_setup_registry.sh"  "Local Docker registry (rate-limit cache)"
 
 banner "Step 8: Pre-pull SWE-bench Docker images"
@@ -105,8 +107,8 @@ ECR_REGISTRY="${ECR_REGISTRY:-}" \
 "${_EVAL_PY}" "${SCRIPT_DIR}/08_pull_images.py"
 ok "Step 8 done"
 
-run_step  9  "09_run_terminalbench.sh" "TerminalBench evaluation"
-run_step 10  "10_run_sweBench.sh"      "SWE-bench evaluation"
+run_step  9  "09_run_terminalbench.sh" "TerminalBench evaluation (Terminus)"
+run_step 10  "10_run_sweBench.sh"      "SWE-bench evaluation (mini-swe-agent)"
 run_step 11  "11_collect_results.sh"   "Collect and archive results"
 
 # ---------------------------------------------------------------------------

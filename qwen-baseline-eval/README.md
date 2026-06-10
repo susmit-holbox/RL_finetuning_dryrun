@@ -1,6 +1,20 @@
 # qwen-baseline-eval
 
-End-to-end baseline evaluation of a Qwen model on **SWE-bench** and **TerminalBench** via a local **vLLM** inference endpoint and **OpenHands**.
+End-to-end baseline evaluation of a Qwen model on **SWE-bench** and **TerminalBench**
+via a local **vLLM** inference endpoint, using **one purpose-built executor agent
+per benchmark**:
+
+| Benchmark | Agent | Why |
+|---|---|---|
+| **SWE-bench** | [`mini-swe-agent`](https://github.com/SWE-agent/mini-swe-agent) | The SWE-bench team's canonical apples-to-apples harness — a minimal bash ReAct loop. We run its **text-parsing** `swebench_backticks.yaml` config (fenced ```` ```mswea_bash_command ```` blocks, **no** OpenAI `tool_calls`). |
+| **TerminalBench** | [`Terminus`](https://github.com/harbor-framework/terminal-bench) | terminal-bench's reference agent. Runs in the **host** `tb` process and drives each task container over tmux, parsing a JSON/XML command batch from text (**no** `tool_calls`). |
+
+> **Why this replaces OpenHands:** both agents parse commands from plain text
+> rather than the OpenAI function-calling API, so the Qwen2.5-Coder `hermes`
+> tool-call silent-failure (empty `tool_calls`) — which crippled the OpenHands
+> CodeActAgent — **cannot** affect them. Terminus also runs on the host, so the
+> Docker-gateway/iptables workaround the in-container OpenHands agent needed is
+> gone.
 
 Run inside a `screen` session on a GPU instance and check back later for results.
 
@@ -42,8 +56,21 @@ Results land in `${RESULTS_DIR}/${RUN_TAG}/` and a tarball is created automatica
 | `DOCKER_PASSWORD` | _(blank)_ | Docker Hub password |
 | `SWEBENCH_LIMIT` | `500` | Number of SWE-bench instances (set to 10 for smoke test) |
 | `S3_RESULTS_URI` | _(blank)_ | e.g. `s3://my-bucket/baseline` — sync results here |
+| `SWE_AGENT_VENV_DIR` | `~/mini_swe_venv` | Isolated venv for mini-swe-agent + swebench |
+| `MINI_SWE_VERSION` | _(blank=latest)_ | Pin mini-swe-agent for reproducibility |
+| `SWE_STEP_LIMIT` | `250` | Max agent steps per SWE-bench instance |
+| `TB_VENV_DIR` | `~/tb_venv` | Isolated venv for terminal-bench |
+| `TB_VERSION` | `0.2.18` | Pinned terminal-bench version |
+| `TB_AGENT` | `terminus-2` | `terminus` (=terminus-1) or `terminus-2` (more robust) |
+| `TB_PARSER` | `xml` | terminus-2 only: `xml` (forgiving) or `json` |
+| `LLM_API_KEY` | `dummy` | Non-empty dummy key (litellm requires one; vLLM ignores it) |
 
 ### Choosing `MODEL_FAMILY`
+
+> **Note:** `MODEL_FAMILY` / the vLLM tool-call parser is **no longer on the
+> critical path** — neither executor agent uses `tool_calls`. It only affects
+> the informational Step 5 probe. Reliable tool calling is still nice-to-have
+> if you later add tool-using scaffolds, but the baseline evals don't need it.
 
 | Value | Tool-call parser | Notes |
 |---|---|---|
@@ -64,12 +91,12 @@ For reliable tool calls use `MODEL_FAMILY=qwen3_coder` with a Qwen3-Coder model.
 | 2 | `02_install_vllm.sh` | `pip install vllm` (GPU wheel) |
 | 3 | `03_download_model.sh` | `huggingface-cli download` with resume support |
 | 4 | `04_start_vllm.sh` | Starts `vllm serve` in a sub-screen, waits for `/health` |
-| 5 | `05_test_toolcall.py` | Sends a dummy tool-call payload; surfaces parser failures |
-| 6 | `06_setup_openhands.sh` | Clones OpenHands, writes `config.toml` |
+| 5 | `05_test_toolcall.py` | Sends a dummy tool-call payload (informational — agents don't use `tool_calls`) |
+| 6 | `06_setup_agents.sh` | Creates isolated uv venvs for `mini-swe-agent` (+`swebench`) and `terminal-bench` |
 | 7 | `07_setup_registry.sh` | Starts a local Docker pull-through cache (rate-limit mitigation) |
-| 8 | `08_pull_images.py` | Pre-pulls all SWE-bench images with ghcr.io fallback |
-| 9 | `09_run_terminalbench.sh` | `tb run --agent openhands` |
-| 10 | `10_run_sweBench.sh` | `python run_infer.py --agent-cls CodeActAgent` |
+| 8 | `08_pull_images.py` | Pre-pulls all SWE-bench images; tags both `__` (scoring) and `_1776_` (mini-swe-agent) forms |
+| 9 | `09_run_terminalbench.sh` | `tb run --agent terminus-2 --model openai/<name>` (host → vLLM) |
+| 10 | `10_run_sweBench.sh` | `mini-extra swebench -c swebench_backticks.yaml …` then `swebench.harness.run_evaluation` |
 | 11 | `11_collect_results.sh` | Archives results, optionally syncs to S3 |
 
 ---
@@ -95,21 +122,44 @@ Hub quota from 100 → 200 per 6 hours.
 
 ---
 
+## Validity & comparability
+
+Each benchmark's `run_summary.json` is **self-describing** — it records the
+agent, harness version, dataset+split/version, sampling, and the
+resolved/total/accuracy — so any two runs can be compared directly (e.g.
+pre- vs post-RL-finetune).
+
+To keep results valid and comparable, the harness is held fixed:
+
+- **SWE-bench:** dataset `${SWEBENCH_DATASET}` split `${SWEBENCH_SPLIT}`, scored
+  with the **official** `swebench.harness.run_evaluation` (the same scorer the
+  public leaderboard uses). Agent: `mini-swe-agent` with the text-parsing
+  `swebench_backticks.yaml`, `temperature=0`, `step_limit=${SWE_STEP_LIMIT}`.
+  The reported number is the harness's `resolved_instances / total_instances`.
+- **TerminalBench:** dataset `${TERMINALBENCH_DATASET}==${TERMINALBENCH_VERSION}`,
+  agent `${TB_AGENT}` (pinned `terminal-bench==${TB_VERSION}`), `temperature=0`.
+  The reported number is tb's `accuracy = n_resolved / (n_resolved+n_unresolved)`.
+
+For byte-level reproducibility, pin `MINI_SWE_VERSION` and `TB_VERSION` and keep
+`SWEBENCH_LIMIT=500` (the full Verified split). Lower limits are valid for smoke
+tests but are **not** comparable to full-split numbers.
+
 ## Results layout
 
 ```
 ${RESULTS_DIR}/${RUN_TAG}/
 ├── SUMMARY.json                    ← top-level summary across all steps
-├── toolcall_test.json              ← tool-call endpoint test result
+├── toolcall_test.json              ← tool-call endpoint probe (informational)
 ├── image_pull_manifest.json        ← which images were pulled / failed
 ├── terminalbench/
 │   ├── tb_run.log
-│   ├── results.json
+│   ├── <run-id>/results.json       ← tb BenchmarkResults (n_resolved, accuracy)
 │   └── run_summary.json
 └── sweBench/
     ├── swe_run.log
     ├── scoring.log
-    ├── *.jsonl                     ← raw predictions
+    ├── preds/preds.json            ← SWE-bench predictions (instance_id → patch)
+    ├── *.<run-id>.json             ← official harness score report
     └── run_summary.json
 ```
 

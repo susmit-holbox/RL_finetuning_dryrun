@@ -20,6 +20,23 @@ load_config() {
     [[ -f "$cfg" ]] || die "config.env not found at $cfg"
     # shellcheck source=/dev/null
     source "$cfg"
+
+    # --- Safety-net defaults for the eval-agent vars --------------------------
+    # config.env is GITIGNORED, so a freshly-synced box may carry an older copy
+    # that predates these vars. Scripts run under `set -u`, so any unset var is a
+    # hard error. `: "${VAR:=default}"` fills it in ONLY when unset/empty, so a
+    # value present in config.env still wins. (Mirrors 01_setup_env.sh's
+    # EVAL_VENV_DIR safety net.)
+    : "${LLM_API_KEY:=dummy}"
+    : "${SWE_AGENT_VENV_DIR:=${HOME}/mini_swe_venv}"
+    : "${MINI_SWE_VERSION:=}"
+    : "${SWE_STEP_LIMIT:=250}"
+    : "${SWE_COST_LIMIT:=1000}"
+    : "${TB_VENV_DIR:=${HOME}/tb_venv}"
+    : "${TB_VERSION:=0.2.18}"
+    : "${TB_AGENT:=terminus-2}"
+    : "${TB_PARSER:=xml}"
+
     # Set RUN_TAG if not already set
     if [[ -z "${RUN_TAG:-}" ]]; then
         RUN_TAG="$(date +%Y%m%d_%H%M%S)"

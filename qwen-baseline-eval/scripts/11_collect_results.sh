@@ -23,27 +23,23 @@ summary = {
     "run_tag": "${RUN_TAG}",
     "model_id": "${MODEL_ID}",
     "model_name": "${MODEL_NAME}",
-    "model_family": "${MODEL_FAMILY}",
-    "vllm_port": ${VLLM_PORT},
-    "swebench_dataset": "${SWEBENCH_DATASET}",
-    "swebench_limit": ${SWEBENCH_LIMIT},
+    "provider": "dashscope",
+    "llm_base_url": "${DASHSCOPE_BASE_URL}",
     "terminalbench_dataset": "${TERMINALBENCH_DATASET}",
     "terminalbench_version": "${TERMINALBENCH_VERSION}",
     "subsections": {}
 }
 
-for sub in ["toolcall_test", "terminalbench", "sweBench"]:
-    sub_dir = run_dir / sub
-    sub_summary_file = sub_dir / "run_summary.json"
-    if sub_summary_file.exists():
-        summary["subsections"][sub] = json.loads(sub_summary_file.read_text())
-    else:
-        summary["subsections"][sub] = "not_run"
+tb_summary = run_dir / "terminalbench" / "run_summary.json"
+summary["subsections"]["terminalbench"] = (
+    json.loads(tb_summary.read_text()) if tb_summary.exists() else "not_run"
+)
 
-toolcall_file = run_dir / "toolcall_test.json"
-if toolcall_file.exists():
-    tc = json.loads(toolcall_file.read_text())
-    summary["tool_calls_populated"] = tc.get("tool_calls_populated", False)
+endpoint_file = run_dir / "endpoint_test.json"
+if endpoint_file.exists():
+    ep = json.loads(endpoint_file.read_text())
+    summary["endpoint_basic_ok"] = ep.get("basic_completion_ok", False)
+    summary["endpoint_tool_calls_populated"] = ep.get("tool_calls_populated", False)
 
 out = run_dir / "SUMMARY.json"
 out.write_text(json.dumps(summary, indent=2))

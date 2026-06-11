@@ -1,19 +1,14 @@
 #!/usr/bin/env bash
-# 09_run_terminalbench.sh — Run TerminalBench evaluation using the Terminus agent.
+# 09_run_terminalbench.sh — Run TerminalBench against the DashScope
+# (Alibaba Cloud) OpenAI-compatible endpoint.
 #
-# Why Terminus (vs the old in-container OpenHands tb-agent):
-#   • Terminus is terminal-bench's own reference agent. It runs IN THE HOST
-#     `tb` process and drives each task container purely over tmux
-#     (send_keys / capture_pane). The LLM HTTP calls are therefore made FROM
-#     THE HOST, so vLLM is reached at http://localhost:${VLLM_PORT}/v1 directly
-#     — NO Docker bridge gateway IP and NO iptables workaround (unlike the old
-#     OpenHands agent, which pip-installed itself INSIDE every container).
-#   • Terminus parses a JSON (terminus-1) or JSON/XML (terminus-2) command batch
-#     from plain text — it does NOT use the OpenAI tool_calls API, so the
-#     Qwen2.5-Coder `hermes` tool-call silent-failure does not affect it.
+# Terminus runs IN THE HOST `tb` process and drives each task container over
+# tmux. The LLM HTTP calls are made FROM THE HOST, directly to the DashScope
+# base URL — so no docker-bridge gateway IP and no iptables workaround.
 #
-# Both the agent name (terminus / terminus-2) and the terminus-2 parser
-# (xml / json) are configurable via TB_AGENT / TB_PARSER in config.env.
+# Terminus parses a JSON (terminus-1) or JSON/XML (terminus-2) command batch
+# from plain text, so this run does NOT depend on the model exposing
+# OpenAI-style tool_calls correctly.
 #
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib.sh"
@@ -36,13 +31,14 @@ if [[ -f "${SCRIPT_DIR}/../results/.tb_python" ]]; then TB_PY=$(cat "${SCRIPT_DI
 [[ -x "$TB_PY" ]] || TB_PY=$(eval_python)
 
 # ---------------------------------------------------------------------------
-# Pre-flight: vLLM must be healthy ON THE HOST (Terminus calls it from here).
+# Pre-flight: DashScope creds present, Docker running.
 # ---------------------------------------------------------------------------
-if ! curl -sf "http://localhost:${VLLM_PORT}/health" &>/dev/null; then
-    die "vLLM not healthy at localhost:${VLLM_PORT}. Run 04_start_vllm.sh first."
-fi
-HOST_LLM_BASE_URL="http://localhost:${VLLM_PORT}/v1"
-log "Terminus → vLLM URL (host): ${HOST_LLM_BASE_URL}"
+[[ -n "${DASHSCOPE_API_KEY:-}" ]] || die "DASHSCOPE_API_KEY missing — set it in config.env"
+[[ -n "${DASHSCOPE_BASE_URL:-}" ]] || die "DASHSCOPE_BASE_URL missing — set it in config.env"
+docker info &>/dev/null 2>&1 || die "Docker is not running — each TB task needs its container."
+
+log "DashScope base URL: ${DASHSCOPE_BASE_URL}"
+log "Model:              ${MODEL_NAME}"
 
 # ---------------------------------------------------------------------------
 # Output directory
@@ -54,16 +50,16 @@ LOG_FILE="${OUT_DIR}/tb_run.log"
 # ---------------------------------------------------------------------------
 # LLM wiring for litellm (Terminus uses litellm under the hood).
 #   --model openai/<served-name>     → generic OpenAI-compatible routing
-#   --agent-kwarg api_base/api_key   → forwarded into the Terminus LiteLLM client
+#   --agent-kwarg api_base/api_key   → forwarded into Terminus' LiteLLM client
 #   OPENAI_* env                     → belt-and-suspenders for litellm's client
 # ---------------------------------------------------------------------------
-export OPENAI_API_KEY="${LLM_API_KEY:-dummy}"
-export OPENAI_API_BASE="${HOST_LLM_BASE_URL}"
-export OPENAI_BASE_URL="${HOST_LLM_BASE_URL}"
+export OPENAI_API_KEY="${DASHSCOPE_API_KEY}"
+export OPENAI_API_BASE="${DASHSCOPE_BASE_URL}"
+export OPENAI_BASE_URL="${DASHSCOPE_BASE_URL}"
 
 AGENT_KWARGS=(
-    --agent-kwarg "api_base=${HOST_LLM_BASE_URL}"
-    --agent-kwarg "api_key=${LLM_API_KEY:-dummy}"
+    --agent-kwarg "api_base=${DASHSCOPE_BASE_URL}"
+    --agent-kwarg "api_key=${DASHSCOPE_API_KEY}"
     --agent-kwarg "temperature=0.0"
 )
 
@@ -72,6 +68,7 @@ AGENT_KWARGS=(
 # context_length_exceeded). See lib.sh:ensure_litellm_hook.
 HOOK_DIR=$(ensure_litellm_hook)
 log "Context window advertised to agent: ${MAX_MODEL_LEN} tokens (via litellm hook)"
+
 # parser_name is a terminus-2-only kwarg (terminus-1 has no such argument).
 if [[ "${TB_AGENT}" == "terminus-2" && -n "${TB_PARSER:-}" ]]; then
     AGENT_KWARGS+=( --agent-kwarg "parser_name=${TB_PARSER}" )
@@ -119,7 +116,6 @@ RESULTS_JSON=$(find "${OUT_DIR}" -name "results.json" -type f 2>/dev/null \
 N_RESOLVED="?"; N_TOTAL="?"; ACCURACY="?"
 if [[ -n "$RESULTS_JSON" ]]; then
     log "Results file: ${RESULTS_JSON}"
-    # terminal-bench BenchmarkResults schema: n_resolved, n_unresolved, accuracy
     read -r N_RESOLVED N_TOTAL ACCURACY < <("$TB_PY" - "$RESULTS_JSON" <<'PYPARSE'
 import json, sys
 from pathlib import Path
@@ -148,10 +144,11 @@ cat > "${OUT_DIR}/run_summary.json" <<SUMMARY
   "harness": "terminal-bench ${TB_VERSION:-latest}",
   "model": "${MODEL_ID}",
   "model_name": "${MODEL_NAME}",
+  "provider": "dashscope",
   "dataset": "${TERMINALBENCH_DATASET}",
   "version": "${TERMINALBENCH_VERSION}",
   "n_concurrent": ${TERMINALBENCH_WORKERS},
-  "vllm_url": "${HOST_LLM_BASE_URL}",
+  "llm_base_url": "${DASHSCOPE_BASE_URL}",
   "run_tag": "${RUN_TAG}",
   "resolved": "${N_RESOLVED}",
   "total": "${N_TOTAL}",

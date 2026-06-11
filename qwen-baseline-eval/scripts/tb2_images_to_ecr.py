@@ -91,6 +91,10 @@ def parse_args():
                     help="only mirror tasks whose name matches this regex")
     ap.add_argument("--force", action="store_true", default=env("FORCE", "0") == "1",
                     help="re-pull/push even if the ECR tag already exists")
+    ap.add_argument("--hydrate", action="store_true", default=env("HYDRATE", "0") == "1",
+                    help="REVERSE mode: pull each task image FROM your ECR and retag it to "
+                         "the name task.toml expects (alexgshaw/<task>:<tag>) so Harbor runs "
+                         "it locally and never pulls Docker Hub. No pushing.")
     ap.add_argument("--build-fallback", action="store_true",
                     default=env("BUILD_FALLBACK", "0") == "1",
                     help="if a task has no docker_image, build it from environment/Dockerfile")
@@ -114,6 +118,9 @@ def run(cmd, timeout=None, capture=True, _input=None):
 
 def have(binary):
     return run(["bash", "-lc", f"command -v {binary}"])[0] == 0
+
+def image_exists(ref):
+    return run(["docker", "image", "inspect", ref])[0] == 0
 
 def is_rate_limited(s):
     s = s.lower()
@@ -262,6 +269,28 @@ def ecr_tags_for(task, orig_tag, prefix, version_tag):
     # ECR tags: <=128 chars, [A-Za-z0-9._-] only
     return [re.sub(r"[^A-Za-z0-9._-]", "-", t)[:128] for t in tags]
 
+def hydrate_one(t, cfg, ec):
+    """Pull a task image FROM ECR and retag it to the name task.toml declares,
+    so Harbor finds it locally (compose pull_policy=missing) and skips Docker Hub."""
+    task, src = t["task"], t["docker_image"]
+    if not src:
+        return {"task": task, "status": "no_image"}
+    if not cfg.force and image_exists(src):
+        log(f"[skip] {task} — '{src}' already present locally")
+        return {"task": task, "status": "skipped", "src": src}
+    primary_tag = ecr_tags_for(task, None, cfg.tag_prefix, False)[0]
+    ecr_ref = f"{cfg.ecr_registry}:{primary_tag}"
+    ok_pull, out = docker_pull(ecr_ref, cfg.platform)
+    if not ok_pull:
+        err(f"[fail] {task} — pull '{ecr_ref}' failed: {out.strip()[:200]}")
+        return {"task": task, "status": "pull_failed", "ecr": ecr_ref, "error": out.strip()[:300]}
+    run(["docker", "tag", ecr_ref, src])
+    if not cfg.no_prune and ecr_ref != src:
+        run(["docker", "rmi", ecr_ref])  # keep only the alexgshaw/... tag Harbor needs
+    ok(f"[done] {task} — {ecr_ref} → {src}")
+    return {"task": task, "status": "hydrated", "src": src, "ecr": ecr_ref}
+
+
 def mirror_one(t, cfg, ec):
     task = t["task"]
     src = t["docker_image"]
@@ -333,9 +362,16 @@ def main():
     log(f"{kind} ECR | svc=aws {ec['svc']} | login_host={ec['login_host']} "
         f"| repo={ec['repo']} | region={ec['region']}")
 
-    ecr_login(ec)
-    ecr_ensure_repo(ec)
-    dockerhub_login(os.environ.get("DOCKER_USERNAME", ""), os.environ.get("DOCKER_PASSWORD", ""))
+    if cfg.hydrate:
+        # Reverse mode: pull from ECR, retag to task.toml names. Read-only on ECR.
+        if not ec["public"]:
+            ecr_login(ec)  # private pull needs auth; public ECR pull is anonymous
+        worker, verb = hydrate_one, "Hydrating"
+    else:
+        ecr_login(ec)
+        ecr_ensure_repo(ec)
+        dockerhub_login(os.environ.get("DOCKER_USERNAME", ""), os.environ.get("DOCKER_PASSWORD", ""))
+        worker, verb = mirror_one, "Mirroring"
 
     repo_dir = clone_repo(cfg.repo_url, cfg.ref, cfg.work_dir)
     tasks = discover_tasks(repo_dir, cfg.task_filter)
@@ -346,9 +382,9 @@ def main():
         die("No tasks found — check --ref / --task-filter / repo layout.")
 
     results = []
-    log(f"Mirroring with {cfg.workers} worker(s)… (prune_after_push={not cfg.no_prune})")
+    log(f"{verb} with {cfg.workers} worker(s)…")
     with cf.ThreadPoolExecutor(max_workers=cfg.workers) as pool:
-        futs = {pool.submit(mirror_one, t, cfg, ec): t["task"] for t in tasks}
+        futs = {pool.submit(worker, t, cfg, ec): t["task"] for t in tasks}
         done = 0
         for fut in cf.as_completed(futs):
             done += 1
@@ -371,7 +407,8 @@ def main():
             line += f"  -> {names[:8]}{'…' if len(names) > 8 else ''}"
         log(line)
     ok(f"Manifest: {cfg.manifest}")
-    bad = sum(len(v) for k, v in by.items() if k not in ("pushed", "skipped", "no_image"))
+    bad = sum(len(v) for k, v in by.items()
+              if k not in ("pushed", "hydrated", "skipped", "no_image"))
     return 1 if bad else 0
 
 

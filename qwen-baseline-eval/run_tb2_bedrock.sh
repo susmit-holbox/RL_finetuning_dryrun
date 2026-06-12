@@ -60,7 +60,29 @@ EFFORT="${EFFORT:-high}"
 
 N_CONCURRENT="${N_CONCURRENT:-4}"      # concurrent trials (Bedrock throttles — keep modest)
 N_TASKS="${N_TASKS:-0}"               # 0 = all 89; >0 caps task count (smoke test)
-TASK_FILTER="${TASK_FILTER:-}"        # glob for harbor -i (and hydrate subset), e.g. 'chess*'
+TASK_FILTER="${TASK_FILTER:-}"        # single glob for harbor -i (and hydrate subset), e.g. 'chess*'
+
+# --- Rerun / recovery knobs --------------------------------------------------
+# Most TB2 failures with a strong model are AGENT TIMEOUTS on compute-heavy
+# tasks (compile, train, render, emulate) — not wrong answers. Give those tasks
+# more wall-clock and less host contention and they pass on a second run.
+#
+#   AGENT_TIMEOUT_MULT  multiply EACH task's agent timeout (e.g. 2.0). The single
+#                       biggest lever for timeout failures.
+#   INCLUDE_TASKS       explicit bare task names to run (space/comma/newline list).
+#                       Each becomes a separate `-i` so only these tasks run.
+#   RERUN_RESULT        path to a previous run's result.json — auto-extracts its
+#                       tasks to rerun and sets INCLUDE_TASKS for you. Pairs with
+#                       AGENT_TIMEOUT_MULT.
+#   RERUN_SCOPE         which prior tasks RERUN_RESULT selects:
+#                         errored (default) → only AgentTimeout / RuntimeError /
+#                                             other crashes (where more time helps)
+#                         all               → every task that didn't pass (also
+#                                             retries genuine wrong-answers; costs more)
+AGENT_TIMEOUT_MULT="${AGENT_TIMEOUT_MULT:-}"
+INCLUDE_TASKS="${INCLUDE_TASKS:-}"
+RERUN_RESULT="${RERUN_RESULT:-}"
+RERUN_SCOPE="${RERUN_SCOPE:-errored}"
 
 HYDRATE="${HYDRATE:-1}"               # 1 = pre-load images from ECR before running
 HYDRATE_WORKERS="${HYDRATE_WORKERS:-4}"
@@ -137,13 +159,73 @@ case "$BEDROCK_MODEL" in
 esac
 
 # ---------------------------------------------------------------------------
+# Step 2.5 — Resolve the explicit task-include list (rerun support)
+# ---------------------------------------------------------------------------
+# If RERUN_RESULT points at a prior result.json, pull its failed+errored task
+# names (bare names — the __<hash> suffix is harbor's per-trial id, not the task
+# name) and load them into INCLUDE_TASKS.
+if [[ -n "$RERUN_RESULT" ]]; then
+    [[ -f "$RERUN_RESULT" ]] || die "RERUN_RESULT not found: ${RERUN_RESULT}"
+    banner "Step 2.5: Extracting tasks from ${RERUN_RESULT} (scope=${RERUN_SCOPE})"
+    EXTRACTED="$(python3 - "$RERUN_RESULT" "$RERUN_SCOPE" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+scope = sys.argv[2] if len(sys.argv) > 2 else "errored"
+errored = set()      # crashed / timed out (in exception_stats)
+zeros = set()        # reward 0.0
+passed = set()       # reward 1.0 anywhere
+def walk(o):
+    if isinstance(o, dict):
+        rs = o.get("reward_stats", {})
+        if isinstance(rs, dict):
+            for metric in rs.values():               # e.g. {"reward": {"0.0":[...], "1.0":[...]}}
+                if isinstance(metric, dict):
+                    for k, tasks in metric.items():
+                        bucket = passed if str(k) in ("1.0", "1") else (
+                                 zeros if str(k) in ("0.0", "0") else None)
+                        if bucket is not None:
+                            for t in tasks: bucket.add(t.split("__")[0])
+        es = o.get("exception_stats", {})             # AgentTimeoutError, RuntimeError, …
+        if isinstance(es, dict):
+            for tasks in es.values():
+                for t in tasks: errored.add(t.split("__")[0])
+        for v in o.values(): walk(v)
+    elif isinstance(o, list):
+        for v in o: walk(v)
+walk(d)
+if scope == "all":
+    sel = (zeros | errored) - passed              # every non-pass
+else:                                              # "errored": only timeouts/crashes
+    sel = errored - passed
+print(" ".join(sorted(sel)))
+PY
+)"
+    [[ -n "$EXTRACTED" ]] || die "No tasks to rerun in ${RERUN_RESULT} (scope=${RERUN_SCOPE})."
+    INCLUDE_TASKS="$EXTRACTED"
+    log "Rerun set ($(echo "$EXTRACTED" | wc -w) tasks): ${EXTRACTED}"
+fi
+
+# Normalise INCLUDE_TASKS (commas/newlines → spaces) into an array.
+INCLUDE_ARR=()
+if [[ -n "$INCLUDE_TASKS" ]]; then
+    read -r -a INCLUDE_ARR <<< "$(echo "$INCLUDE_TASKS" | tr ',\n' '  ')"
+    log "Running ${#INCLUDE_ARR[@]} explicit task(s) via -i."
+fi
+
+# ---------------------------------------------------------------------------
 # Step 3 — Hydrate task images from ECR (optional)
 # ---------------------------------------------------------------------------
 if [[ "$HYDRATE" == 1 ]]; then
     banner "Step 3: Hydrate TB2 images from ECR"
     log "Pulling task images from ${ECR_REGISTRY} and retagging to the names Harbor expects…"
     HYDRATE_ARGS=(--ecr-registry "$ECR_REGISTRY" --hydrate --workers "$HYDRATE_WORKERS")
-    [[ -n "$TASK_FILTER" ]] && HYDRATE_ARGS+=(--task-filter "${TASK_FILTER//\*/.*}")
+    if [[ ${#INCLUDE_ARR[@]} -gt 0 ]]; then
+        # Pull only the tasks we're about to run: anchored alternation regex.
+        HYDRATE_RE="^($(IFS='|'; echo "${INCLUDE_ARR[*]}"))$"
+        HYDRATE_ARGS+=(--task-filter "$HYDRATE_RE")
+    elif [[ -n "$TASK_FILTER" ]]; then
+        HYDRATE_ARGS+=(--task-filter "${TASK_FILTER//\*/.*}")
+    fi
     python3 "${SCRIPT_DIR}/tb2_images_to_ecr.py" "${HYDRATE_ARGS[@]}" \
         || warn "Hydrate had failures — Harbor will pull missing images from Docker Hub on demand."
 else
@@ -168,7 +250,14 @@ HARBOR_ARGS=(
     --job-name "$RUN_TAG"
 )
 [[ "$N_TASKS" != 0 ]] && HARBOR_ARGS+=(-l "$N_TASKS")
-[[ -n "$TASK_FILTER" ]] && HARBOR_ARGS+=(-i "$TASK_FILTER")
+# Explicit task list (rerun) takes precedence; otherwise a single glob filter.
+if [[ ${#INCLUDE_ARR[@]} -gt 0 ]]; then
+    for _t in "${INCLUDE_ARR[@]}"; do HARBOR_ARGS+=(-i "$_t"); done
+elif [[ -n "$TASK_FILTER" ]]; then
+    HARBOR_ARGS+=(-i "$TASK_FILTER")
+fi
+# Give compute-heavy tasks more wall-clock (the dominant TB2 failure is timeout).
+[[ -n "$AGENT_TIMEOUT_MULT" ]] && HARBOR_ARGS+=(--agent-timeout-multiplier "$AGENT_TIMEOUT_MULT")
 [[ -n "$EFFORT" ]] && HARBOR_ARGS+=(--ak "reasoning_effort=${EFFORT}")
 # Forward the region to the agent process too (belt-and-suspenders alongside the export).
 HARBOR_ARGS+=(--ae "AWS_REGION_NAME=${AWS_REGION}")
@@ -225,6 +314,9 @@ cat > "${JOBS_DIR}/${RUN_TAG}/run_summary.json" <<SUMMARY
   "dataset": "${DATASET}",
   "n_concurrent": ${N_CONCURRENT},
   "n_tasks": "${N_TASKS}",
+  "agent_timeout_multiplier": "${AGENT_TIMEOUT_MULT:-1.0}",
+  "include_tasks_count": ${#INCLUDE_ARR[@]},
+  "rerun_from": "${RERUN_RESULT:-}",
   "images_from_ecr": $([[ "$HYDRATE" == 1 ]] && echo true || echo false),
   "ecr_registry": "${ECR_REGISTRY}",
   "run_tag": "${RUN_TAG}",

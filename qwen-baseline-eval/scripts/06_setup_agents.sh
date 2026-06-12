@@ -1,31 +1,37 @@
 #!/usr/bin/env bash
-# 06_setup_agents.sh — Install the TerminalBench evaluation harness.
+# 06_setup_agents.sh — Install the Harbor harness (TB-2 / Terminal-Bench 2.0).
 #
-# We use Terminus (terminal-bench's own reference agent) in its own uv venv.
-# Terminus runs IN THE HOST `tb` process and drives each task container over
-# tmux (send_keys / capture_pane), so the LLM HTTP calls are made FROM THE
-# HOST to the DashScope endpoint — no docker-bridge gateway IP or iptables
-# workaround needed (unlike the old in-container OpenHands agent).
+# Terminal-Bench 2.0 (the `terminal-bench@2.0` dataset) is NOT runnable by the
+# `tb` CLI from the `terminal-bench` package — that CLI's registry only knows
+# `terminal-bench-core@*`. TB-2 ships under a different harness, **Harbor**:
 #
-# Terminus parses a JSON (terminus-1) or JSON/XML (terminus-2) command batch
-# from plain text — it does NOT use the OpenAI tool_calls API, so any
-# tool-call parser quirks on the DashScope side don't affect it.
+#     pip install harbor
+#     harbor run --dataset terminal-bench@2.0 --agent terminus-2 \
+#                --model openai/<name> --agent-kwarg api_base=…
+#
+# Harbor's Terminus-2 agent (`harbor.agents.terminus_2.terminus_2.Terminus2`)
+# uses litellm under the hood, runs in the host process, and drives each task
+# container via tmux. It accepts model_name / api_base / temperature / parser_name
+# kwargs through `--agent-kwarg key=value`. API keys flow through environment
+# variables (e.g. `OPENAI_API_KEY`) — Terminus-2 has no api_key constructor
+# parameter, so we set the env var on the host (and via `--agent-env` for
+# belt-and-suspenders).
 #
 # Markers written for downstream steps:
-#   results/.tb_python  → terminal-bench venv python (step 9 parsing)
-#   results/.tb_bin     → `tb` entry point          (step 9)
+#   results/.harbor_python  → harbor venv python (step 9 parsing)
+#   results/.harbor_bin     → `harbor` entry point (step 9)
 #
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib.sh"
 load_config
 
-log "=== Step 6: Setup TerminalBench (Terminus) ==="
+log "=== Step 6: Setup Harbor (TB-2 / Terminus-2) ==="
 
 RESULTS_MARKER_DIR="${SCRIPT_DIR}/../results"
 mkdir -p "${RESULTS_MARKER_DIR}"
 
 # ---------------------------------------------------------------------------
-# Resolve uv and a terminal-bench-compatible Python (>=3.12).
+# Resolve uv and a harbor-compatible Python (>=3.12).
 # ---------------------------------------------------------------------------
 resolve_uv() {
     local u=""
@@ -59,11 +65,11 @@ if [[ -z "$PY312" ]]; then
     log "No Python 3.12/3.13 found — fetching one via uv…"
     "$UV" python install 3.12 && PY312=$("$UV" python find 3.12) || true
 fi
-[[ -x "$PY312" ]] || die "Need Python 3.12/3.13 for Terminus. Run step 1 or: uv python install 3.12"
+[[ -x "$PY312" ]] || die "Need Python 3.12/3.13 for Harbor. Run step 1 or: uv python install 3.12"
 log "Agent Python: ${PY312} ($("$PY312" --version))"
 
 # ---------------------------------------------------------------------------
-# (Re)create the terminal-bench venv and install the harness.
+# (Re)create the harbor venv and install the harness.
 # ---------------------------------------------------------------------------
 make_agent_venv() {
     local venv_dir="$1"; shift
@@ -81,27 +87,35 @@ make_agent_venv() {
     retry 3 15 "$UV" pip install --python "${venv_dir}/bin/python" "$@"
 }
 
-TB_PKG="terminal-bench"
-[[ -n "${TB_VERSION:-}" ]] && TB_PKG="terminal-bench==${TB_VERSION}"
-make_agent_venv "${TB_VENV_DIR}" "${TB_PKG}"
+HARBOR_PKG="harbor"
+[[ -n "${HARBOR_VERSION:-}" ]] && HARBOR_PKG="harbor==${HARBOR_VERSION}"
+make_agent_venv "${HARBOR_VENV_DIR}" "${HARBOR_PKG}"
 
-TB_PY="${TB_VENV_DIR}/bin/python"
-TB_BIN="${TB_VENV_DIR}/bin/tb"
-[[ -x "$TB_BIN" ]] || die "tb not found at ${TB_BIN} after install."
+HARBOR_PY="${HARBOR_VENV_DIR}/bin/python"
+HARBOR_BIN="${HARBOR_VENV_DIR}/bin/harbor"
+[[ -x "$HARBOR_BIN" ]] || die "harbor not found at ${HARBOR_BIN} after install."
 
-# Confirm the requested Terminus agent variant is registered in this version.
-"$TB_PY" - "$TB_AGENT" <<'PY' || die "Requested TB_AGENT not available in installed terminal-bench."
+# Confirm the requested agent is registered in this Harbor version.
+"$HARBOR_PY" - "$TB_AGENT" <<'PY' || die "Requested TB_AGENT not available in installed Harbor."
 import sys
-from terminal_bench.agents.agent_name import AgentName
 want = sys.argv[1]
-names = [a.value for a in AgentName]
+try:
+    from harbor.agents.factory import _AGENT_MAP as M
+    names = list(M.keys())
+except Exception:
+    # Older / alternate layouts: try the AgentName enum
+    from harbor.agents.factory import AgentName
+    names = [a.value for a in AgentName]
 assert want in names, f"agent '{want}' not in {names}"
-print(f"[ok] TB agent '{want}' available")
+print(f"[ok] Harbor agent '{want}' available")
 PY
 
-echo "${TB_PY}"  > "${RESULTS_MARKER_DIR}/.tb_python"
-echo "${TB_BIN}" > "${RESULTS_MARKER_DIR}/.tb_bin"
-ok "terminal-bench: $("$TB_BIN" --version 2>/dev/null | tr -d '\n' || echo installed) | agent=${TB_AGENT}${TB_PARSER:+ parser=${TB_PARSER}}"
+echo "${HARBOR_PY}"  > "${RESULTS_MARKER_DIR}/.harbor_python"
+echo "${HARBOR_BIN}" > "${RESULTS_MARKER_DIR}/.harbor_bin"
+# Backwards-compatible aliases so older marker readers don't break.
+echo "${HARBOR_PY}"  > "${RESULTS_MARKER_DIR}/.tb_python"
+echo "${HARBOR_BIN}" > "${RESULTS_MARKER_DIR}/.tb_bin"
+ok "Harbor: $("$HARBOR_BIN" --version 2>/dev/null | tr -d '\n' || echo installed) | agent=${TB_AGENT}${TB_PARSER:+ parser=${TB_PARSER}}"
 
 ok "=== Agent setup complete ==="
-log "terminal-bench venv: ${TB_VENV_DIR}  (tb / Terminus)"
+log "Harbor venv: ${HARBOR_VENV_DIR}  (harbor / Terminus-2)"

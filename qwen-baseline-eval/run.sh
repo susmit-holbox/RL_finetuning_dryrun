@@ -125,7 +125,7 @@ RUN_TAG="${RUN_TAG}" \
     fi
 }
 
-run_step  6  "06_setup_agents.sh"    "Install eval agent (Terminus / terminal-bench)"
+run_step  6  "06_setup_agents.sh"    "Install eval agent (Harbor / Terminus-2)"
 
 banner "Step 8: Pre-pull TerminalBench task images from public ECR"
 _EVAL_PY=$(cat "${REPO_DIR}/results/.eval_python" 2>/dev/null || command -v python3)
@@ -141,7 +141,7 @@ RUN_TAG="${RUN_TAG}" \
 "${_EVAL_PY}" "${SCRIPT_DIR}/08_pull_tb_images.py"
 ok "Step 8 done"
 
-run_step  9  "09_run_terminalbench.sh" "TerminalBench evaluation (Terminus → DashScope)"
+run_step  9  "09_run_terminalbench.sh" "TerminalBench 2.0 via Harbor (Terminus-2 → DashScope)"
 run_step 11  "11_collect_results.sh"   "Collect and archive results"
 
 # ---------------------------------------------------------------------------

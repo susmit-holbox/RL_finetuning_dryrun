@@ -25,8 +25,11 @@ load_config() {
     # config.env is GITIGNORED, so a freshly-synced box may carry an older copy
     # that predates these vars. Scripts run under `set -u`, so any unset var is a
     # hard error. `: "${VAR:=default}"` fills it in ONLY when unset/empty.
-    : "${TB_VENV_DIR:=${HOME}/tb_venv}"
-    : "${TB_VERSION:=0.2.18}"
+    # Harbor (TB-2 / Terminal-Bench 2.0 harness) — installed into HARBOR_VENV_DIR.
+    # HARBOR_VENV_DIR replaces the older TB_VENV_DIR; we honour the latter for
+    # backwards compatibility with config.env files written for the old flow.
+    : "${HARBOR_VENV_DIR:=${TB_VENV_DIR:-${HOME}/harbor_venv}}"
+    : "${HARBOR_VERSION:=}"                      # blank = pip-install latest
     : "${TB_AGENT:=terminus-2}"
     : "${TB_PARSER:=xml}"
     : "${TERMINALBENCH_WORKERS:=4}"
